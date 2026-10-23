@@ -112,6 +112,11 @@ public:
   int q_ = 0;
   int fps_ = 30;
   int gop_ = 0xFFFF;
+  // --- warm-up instrumentation (test build only) ---
+  bool first_packet_seen_ = false;
+  int empty_before_first_packet_ = 0;
+  std::chrono::steady_clock::time_point created_xyz_{};
+  bool created_xyz_set_ = false;
   int thread_count_ = 1;
   int gpu_ = 0;
   RamEncodeCallback callback_ = NULL;
@@ -339,6 +344,7 @@ private:
   int do_encode(AVFrame *frame, const void *obj, int64_t ms) {
     int ret;
     bool encoded = false;
+    if (!created_xyz_set_) { created_xyz_ = util::now(); created_xyz_set_ = true; }
     frame->pts = ms;
     if ((ret = avcodec_send_frame(c_, frame)) < 0) {
       LOG_ERROR(std::string("avcodec_send_frame failed, ret = ") + av_err2str(ret));
@@ -358,10 +364,18 @@ private:
         goto _exit;
       }
       encoded = true;
+      if (!first_packet_seen_) {
+        first_packet_seen_ = true;
+        LOG_INFO("WARMUP first packet after " + std::to_string(util::elapsed_ms(created_xyz_)) +
+                 " ms, empty_before=" + std::to_string(empty_before_first_packet_) +
+                 ", codec=" + name_ +
+                 ", key=" + std::to_string((pkt_->flags & AV_PKT_FLAG_KEY) ? 1 : 0));
+      }
       callback_(pkt_->data, pkt_->size, pkt_->pts,
                 pkt_->flags & AV_PKT_FLAG_KEY, obj);
     }
   _exit:
+    if (!encoded && !first_packet_seen_) empty_before_first_packet_++;
     av_packet_unref(pkt_);
     return encoded ? 0 : -1;
   }
