@@ -6,7 +6,8 @@ use crate::{
     ffmpeg::{init_av_log, AVPixelFormat},
     ffmpeg_ram::{
         ffmpeg_linesize_offset_length, ffmpeg_ram_encode, ffmpeg_ram_free_encoder,
-        ffmpeg_ram_new_encoder, ffmpeg_ram_set_bitrate, CodecInfo, AV_NUM_DATA_POINTERS,
+        ffmpeg_ram_new_encoder, ffmpeg_ram_set_bitrate, ffmpeg_ram_set_force_key, CodecInfo,
+        AV_NUM_DATA_POINTERS,
     },
 };
 use log::trace;
@@ -148,6 +149,13 @@ impl Encoder {
         } else {
             Err(())
         }
+    }
+
+    /// Ask the native encoder to emit the next frame as an IDR. Used by the
+    /// refresh path so a keyframe can be produced without tearing the encoder
+    /// down and paying the warm-up cost again.
+    pub fn force_keyframe(&mut self) {
+        unsafe { ffmpeg_ram_set_force_key(self.codec) };
     }
 
     pub fn format_from_name(name: String) -> Result<DataFormat, ()> {

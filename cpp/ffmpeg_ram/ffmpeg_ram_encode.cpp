@@ -117,6 +117,10 @@ public:
   RamEncodeCallback callback_ = NULL;
   int offset_[AV_NUM_DATA_POINTERS] = {0};
 
+  // Requested via ffmpeg_ram_set_force_key(); makes the next frame an IDR
+  // without tearing down and rebuilding the encoder.
+  bool force_key_ = false;
+
   AVHWDeviceType hw_device_type_ = AV_HWDEVICE_TYPE_NONE;
   AVPixelFormat hw_pixfmt_ = AV_PIX_FMT_NONE;
   AVBufferRef *hw_device_ctx_ = NULL;
@@ -307,6 +311,8 @@ public:
     return util_encode::change_bit_rate(c_, name_, kbs) ? 0 : -1;
   }
 
+  void set_force_key() { force_key_ = true; }
+
 private:
   int set_hwframe_ctx() {
     AVBufferRef *hw_frames_ref;
@@ -340,6 +346,12 @@ private:
     int ret;
     bool encoded = false;
     frame->pts = ms;
+    // A refresh requested by the consumer only needs a fresh IDR; forcing it
+    // here avoids tearing the encoder down (and re-running its warm-up) to get
+    // one. Reset unconditionally so a reused AVFrame does not keep asking for
+    // keyframes on every subsequent frame.
+    frame->pict_type = force_key_ ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
+    force_key_ = false;
     if ((ret = avcodec_send_frame(c_, frame)) < 0) {
       LOG_ERROR(std::string("avcodec_send_frame failed, ret = ") + av_err2str(ret));
       return ret;
@@ -471,4 +483,10 @@ extern "C" int ffmpeg_ram_set_bitrate(FFmpegRamEncoder *encoder, int kbs) {
     LOG_ERROR("ffmpeg_ram_set_bitrate: unknown exception");
   }
   return -1;
+}
+
+extern "C" void ffmpeg_ram_set_force_key(FFmpegRamEncoder *encoder) {
+  if (!encoder)
+    return;
+  encoder->set_force_key();
 }
