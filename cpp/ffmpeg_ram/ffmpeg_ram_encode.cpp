@@ -12,6 +12,8 @@ extern "C" {
 #include <stdlib.h>
 #include <string.h>
 
+#define FFMPEG_RAM_NO_OUTPUT (-2) // no packet yet, not a codec failure
+
 #include "common.h"
 
 #define LOG_MODULE "FFMPEG_RAM_ENC"
@@ -347,21 +349,31 @@ private:
     if (!created_xyz_set_) { created_xyz_ = util::now(); created_xyz_set_ = true; }
     frame->pts = ms;
     if ((ret = avcodec_send_frame(c_, frame)) < 0) {
+      if (ret == AVERROR(EAGAIN)) {
+        // The encoder has not taken this frame yet. Flow control, not a failure.
+        if (!first_packet_seen_) empty_before_first_packet_++;
+        return FFMPEG_RAM_NO_OUTPUT;
+      }
       LOG_ERROR(std::string("avcodec_send_frame failed, ret = ") + av_err2str(ret));
       return ret;
     }
 
-    auto start = util::now();
-    while (ret >= 0 && util::elapsed_ms(start) < DECODE_TIMEOUT_MS) {
-      if ((ret = avcodec_receive_packet(c_, pkt_)) < 0) {
-        if (ret != AVERROR(EAGAIN)) {
-          LOG_ERROR(std::string("avcodec_receive_packet failed, ret = ") + av_err2str(ret));
-        }
-        goto _exit;
+    int first_error = 0;
+    // Drain every packet the encoder has ready. EAGAIN means "nothing more right now".
+    while (true) {
+      ret = avcodec_receive_packet(c_, pkt_);
+      if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+        break;
+      }
+      if (ret < 0) {
+        LOG_ERROR(std::string("avcodec_receive_packet failed, ret = ") + av_err2str(ret));
+        first_error = ret;
+        break;
       }
       if (!pkt_->data || !pkt_->size) {
         LOG_ERROR(std::string("avcodec_receive_packet failed, pkt size is 0"));
-        goto _exit;
+        av_packet_unref(pkt_);
+        break;
       }
       encoded = true;
       if (!first_packet_seen_) {
@@ -373,11 +385,12 @@ private:
       }
       callback_(pkt_->data, pkt_->size, pkt_->pts,
                 pkt_->flags & AV_PKT_FLAG_KEY, obj);
+      av_packet_unref(pkt_);
     }
-  _exit:
     if (!encoded && !first_packet_seen_) empty_before_first_packet_++;
     av_packet_unref(pkt_);
-    return encoded ? 0 : -1;
+    if (first_error) return first_error;
+    return encoded ? 0 : FFMPEG_RAM_NO_OUTPUT;
   }
 
   int fill_frame(AVFrame *frame, uint8_t *data, int data_length,
