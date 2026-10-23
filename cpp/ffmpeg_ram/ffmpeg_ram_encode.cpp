@@ -12,6 +12,15 @@ extern "C" {
 #include <stdlib.h>
 #include <string.h>
 
+#include <chrono>
+#include <thread>
+
+// Hardware encoders can hold a frame back for a while, especially when the rate
+// control is tightening the output. Wait for the packet instead of reporting an
+// empty frame on the first EAGAIN.
+#define ENCODE_PACKET_RETRY_MS 20
+#define ENCODE_PACKET_RETRY_INTERVAL_MS 2
+
 #include "common.h"
 
 #define LOG_MODULE "FFMPEG_RAM_ENC"
@@ -117,6 +126,10 @@ public:
   int empty_before_first_packet_ = 0;
   std::chrono::steady_clock::time_point created_xyz_{};
   bool created_xyz_set_ = false;
+  // --- EAGAIN retry instrumentation (test build only) ---
+  int eagain_count_ = 0;
+  int eagain_recovered_ = 0;
+  int64_t last_pts_ = -1;
   int thread_count_ = 1;
   int gpu_ = 0;
   RamEncodeCallback callback_ = NULL;
@@ -352,11 +365,24 @@ private:
     }
 
     auto start = util::now();
-    while (ret >= 0 && util::elapsed_ms(start) < DECODE_TIMEOUT_MS) {
+    while (ret >= 0 && util::elapsed_ms(start) < ENCODE_PACKET_RETRY_MS) {
       if ((ret = avcodec_receive_packet(c_, pkt_)) < 0) {
-        if (ret != AVERROR(EAGAIN)) {
-          LOG_ERROR(std::string("avcodec_receive_packet failed, ret = ") + av_err2str(ret));
+        if (ret == AVERROR(EAGAIN)) {
+          // Not an error: the encoder has not handed the packet back yet.
+          eagain_count_++;
+          if (eagain_count_ <= 10 || eagain_count_ % 50 == 0) {
+            LOG_INFO("[EAGAIN] no packet yet, pts=" + std::to_string(ms) +
+                     ", prev_pts=" + std::to_string(last_pts_) +
+                     ", waited_ms=" + std::to_string(util::elapsed_ms(start)) +
+                     ", bit_rate=" + std::to_string(c_->bit_rate) +
+                     ", count=" + std::to_string(eagain_count_));
+          }
+          ret = 0;
+          std::this_thread::sleep_for(
+              std::chrono::milliseconds(ENCODE_PACKET_RETRY_INTERVAL_MS));
+          continue;
         }
+        LOG_ERROR(std::string("avcodec_receive_packet failed, ret = ") + av_err2str(ret));
         goto _exit;
       }
       if (!pkt_->data || !pkt_->size) {
@@ -364,6 +390,14 @@ private:
         goto _exit;
       }
       encoded = true;
+      if (util::elapsed_ms(start) > ENCODE_PACKET_RETRY_INTERVAL_MS &&
+          eagain_recovered_ < 10) {
+        eagain_recovered_++;
+        LOG_INFO("[EAGAIN] recovered after " +
+                 std::to_string(util::elapsed_ms(start)) +
+                 " ms, pts=" + std::to_string(ms));
+      }
+      last_pts_ = ms;
       if (!first_packet_seen_) {
         first_packet_seen_ = true;
         LOG_INFO("WARMUP first packet after " + std::to_string(util::elapsed_ms(created_xyz_)) +
