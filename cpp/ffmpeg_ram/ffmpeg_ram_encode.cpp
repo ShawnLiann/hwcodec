@@ -8,9 +8,12 @@ extern "C" {
 }
 
 #include <stdbool.h>
+#include <deque>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define FFMPEG_RAM_NO_OUTPUT (-2) // no packet yet, not a codec failure
 
 #include "common.h"
 
@@ -112,6 +115,9 @@ public:
   int q_ = 0;
   int fps_ = 30;
   int gop_ = 0xFFFF;
+  // Input frames the encoder refused (send_frame -> EAGAIN). Bounded: real-time
+  // screen sharing keeps the newest frames, never an unbounded backlog.
+  std::deque<AVFrame *> pending_;
   int thread_count_ = 1;
   int gpu_ = 0;
   RamEncodeCallback callback_ = NULL;
@@ -291,6 +297,11 @@ public:
   }
 
   void free_encoder() {
+    while (!pending_.empty()) {
+      AVFrame *f = pending_.front();
+      pending_.pop_front();
+      av_frame_free(&f);
+    }
     if (pkt_)
       av_packet_free(&pkt_);
     if (frame_)
@@ -336,34 +347,91 @@ private:
     return err;
   }
 
+  // Take every packet the encoder has ready. EAGAIN only means "nothing more now".
+  void drain_packets(const void *obj, bool &encoded, int &first_error) {
+    while (true) {
+      int r = avcodec_receive_packet(c_, pkt_);
+      if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) {
+        break;
+      }
+      if (r < 0) {
+        LOG_ERROR(std::string("avcodec_receive_packet failed, ret = ") + av_err2str(r));
+        if (!first_error) first_error = r;
+        break;
+      }
+      if (!pkt_->data || !pkt_->size) {
+        LOG_ERROR(std::string("avcodec_receive_packet failed, pkt size is 0"));
+        av_packet_unref(pkt_);
+        continue;
+      }
+      encoded = true;
+      }
+      // The callback copies the payload, so the packet can be released right after.
+      callback_(pkt_->data, pkt_->size, pkt_->pts,
+                pkt_->flags & AV_PKT_FLAG_KEY, obj);
+      av_packet_unref(pkt_);
+    }
+  }
+
+  // Deliver what was produced, then report the most useful result:
+  // packets win over an error that happened after them.
+  int finish_encode(bool encoded, int first_error, int idle_code) {
+    if (first_error) {
+      if (encoded) {
+        LOG_ERROR(std::string("encode error after delivering packets, ret = ") +
+                  av_err2str(first_error));
+        return 0;
+      }
+      return first_error;
+    }
+    return encoded ? 0 : idle_code;
+  }
+
   int do_encode(AVFrame *frame, const void *obj, int64_t ms) {
     int ret;
     bool encoded = false;
+    int first_error = 0;
     frame->pts = ms;
-    if ((ret = avcodec_send_frame(c_, frame)) < 0) {
+
+    // Output already produced belongs to earlier input; take it before touching input.
+    drain_packets(obj, encoded, first_error);
+
+    // Re-offer frames the encoder refused earlier, oldest first.
+    while (!pending_.empty()) {
+      AVFrame *p = pending_.front();
+      ret = avcodec_send_frame(c_, p);
+      if (ret == AVERROR(EAGAIN)) {
+        break;
+      }
+      pending_.pop_front();
+      av_frame_free(&p);
+      if (ret < 0) {
+        LOG_ERROR(std::string("avcodec_send_frame failed, ret = ") + av_err2str(ret));
+        return ret;
+      }
+      drain_packets(obj, encoded, first_error);
+    }
+
+    ret = avcodec_send_frame(c_, frame);
+    if (ret == AVERROR(EAGAIN)) {
+      // Keep the frame instead of dropping it; the caller keeps feeding.
+      if (pending_.size() >= 2) {
+        AVFrame *old = pending_.front();
+        pending_.pop_front();
+        av_frame_free(&old);
+        LOG_INFO("pending input full, dropped the oldest frame");
+      }
+      pending_.push_back(av_frame_clone(frame));
+      drain_packets(obj, encoded, first_error);
+      return finish_encode(encoded, first_error, FFMPEG_RAM_INPUT_REJECTED);
+    }
+    if (ret < 0) {
       LOG_ERROR(std::string("avcodec_send_frame failed, ret = ") + av_err2str(ret));
       return ret;
     }
 
-    auto start = util::now();
-    while (ret >= 0 && util::elapsed_ms(start) < DECODE_TIMEOUT_MS) {
-      if ((ret = avcodec_receive_packet(c_, pkt_)) < 0) {
-        if (ret != AVERROR(EAGAIN)) {
-          LOG_ERROR(std::string("avcodec_receive_packet failed, ret = ") + av_err2str(ret));
-        }
-        goto _exit;
-      }
-      if (!pkt_->data || !pkt_->size) {
-        LOG_ERROR(std::string("avcodec_receive_packet failed, pkt size is 0"));
-        goto _exit;
-      }
-      encoded = true;
-      callback_(pkt_->data, pkt_->size, pkt_->pts,
-                pkt_->flags & AV_PKT_FLAG_KEY, obj);
-    }
-  _exit:
-    av_packet_unref(pkt_);
-    return encoded ? 0 : -1;
+    drain_packets(obj, encoded, first_error);
+    return finish_encode(encoded, first_error, FFMPEG_RAM_NO_PACKET);
   }
 
   int fill_frame(AVFrame *frame, uint8_t *data, int data_length,

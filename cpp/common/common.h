@@ -6,6 +6,10 @@
 #define MAX_GOP 0x7FFFFFFF // i32 max
 
 #define TEST_TIMEOUT_MS 1000
+// Flow-control results of an encode call. Kept outside the errno range so they
+// cannot collide with a real AVERROR() value.
+#define FFMPEG_RAM_NO_PACKET (-100000)      // input accepted, no output yet
+#define FFMPEG_RAM_INPUT_REJECTED (-100001) // input not accepted, frame retained
 #define ENCODE_TIMEOUT_MS 1000
 #define DECODE_TIMEOUT_MS 1000
 
