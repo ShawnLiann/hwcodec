@@ -365,7 +365,6 @@ private:
         continue;
       }
       encoded = true;
-      }
       // The callback copies the payload, so the packet can be released right after.
       callback_(pkt_->data, pkt_->size, pkt_->pts,
                 pkt_->flags & AV_PKT_FLAG_KEY, obj);
@@ -421,7 +420,16 @@ private:
         av_frame_free(&old);
         LOG_INFO("pending input full, dropped the oldest frame");
       }
-      pending_.push_back(av_frame_clone(frame));
+      AVFrame *clone = av_frame_clone(frame);
+      if (!clone) {
+        // Cannot retain the frame; report it as a real error so the caller counts
+        // it instead of believing the input was kept.
+        LOG_ERROR("av_frame_clone failed, rejected frame could not be retained");
+        drain_packets(obj, encoded, first_error);
+        return finish_encode(encoded, first_error ? first_error : AVERROR(ENOMEM),
+                             FFMPEG_RAM_INPUT_REJECTED);
+      }
+      pending_.push_back(clone);
       drain_packets(obj, encoded, first_error);
       return finish_encode(encoded, first_error, FFMPEG_RAM_INPUT_REJECTED);
     }
