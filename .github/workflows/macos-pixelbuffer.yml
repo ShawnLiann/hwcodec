@@ -43,6 +43,11 @@ env:
   VCPKG_ROOT: ${{ github.workspace }}/target/ci-vcpkg
   VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/target/vcpkg-cache,readwrite
   CARGO_TERM_COLOR: always
+  # hwcodec 在 macOS 上以 bindgen 0.59 產生 mux_ffi.rs，其中對 pthread 型別的
+  # offsetof 寫法（&(*(ptr::null::<_opaque_pthread_t>())).field）在較新的 rustc
+  # 是硬錯誤（deref_nullptr）。rustdesk 自己的 macOS CI 因此釘在 1.81
+  # （.github/workflows/flutter-build.yml: MAC_RUST_VERSION: "1.81"），我們照釘。
+  MAC_RUST_TOOLCHAIN: "1.81"
 
 jobs:
   macos:
@@ -75,8 +80,9 @@ jobs:
       - name: Assert target_os is macos
         run: |
           set -euo pipefail
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustc --print cfg --target ${{ matrix.target }} | grep -qx 'target_os="macos"' \
+          rustup toolchain install "$MAC_RUST_TOOLCHAIN" --profile minimal --no-self-update
+          rustup target add --toolchain "$MAC_RUST_TOOLCHAIN" ${{ matrix.target }}
+          rustc +$MAC_RUST_TOOLCHAIN --print cfg --target ${{ matrix.target }} | grep -qx 'target_os="macos"' \
             || { echo "FAIL: target_os is not macos for ${{ matrix.target }}"; exit 1; }
           echo "OK: target_os=macos"
 
@@ -154,14 +160,14 @@ jobs:
         if: ${{ (github.event.inputs.mode || 'fast') == 'fast' }}
         run: |
           set -euo pipefail
-          cargo check --target ${{ matrix.target }} --all-targets 2>&1 | tail -40
+          cargo +$MAC_RUST_TOOLCHAIN check --target ${{ matrix.target }} --all-targets 2>&1 | tail -40
 
       - name: cargo build + test (full)
         if: ${{ github.event.inputs.mode == 'full' }}
         run: |
           set -euo pipefail
-          cargo build --target ${{ matrix.target }} 2>&1 | tail -40
-          cargo test  --target ${{ matrix.target }} -- --nocapture 2>&1 | tail -60
+          cargo +$MAC_RUST_TOOLCHAIN build --target ${{ matrix.target }} 2>&1 | tail -40
+          cargo +$MAC_RUST_TOOLCHAIN test  --target ${{ matrix.target }} -- --nocapture 2>&1 | tail -60
 
       - name: Record environment
         if: always()
@@ -173,6 +179,6 @@ jobs:
             echo "hwcodec base: $(git rev-parse HEAD)"
             echo "vcpkg: $VCPKG_COMMIT"
             echo "ffmpeg overlay: ${{ steps.rustdesk-ports.outputs.commit }}"
-            rustc -V
-            cargo -V
+            rustc +$MAC_RUST_TOOLCHAIN -V
+            cargo +$MAC_RUST_TOOLCHAIN -V
           } | tee env.txt
