@@ -50,12 +50,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { target: x86_64-apple-darwin,  os: macos-15-intel, triplet: x64-osx }
-          - { target: aarch64-apple-darwin, os: macos-14,       triplet: arm64-osx }
-    # push 事件沒有 inputs → 預設只跑 x86_64
-    if: ${{ contains(github.event.inputs.archs || '["x86_64-apple-darwin"]', matrix.target) }}
-    runs-on: ${{ matrix.os }}
+        # push 事件沒有 inputs → 預設只跑 x86_64
+        target: ${{ fromJSON(github.event.inputs.archs || '["x86_64-apple-darwin"]') }}
+    runs-on: ${{ matrix.target == 'aarch64-apple-darwin' && 'macos-14' || 'macos-15-intel' }}
     timeout-minutes: 120
 
     steps:
@@ -64,6 +61,15 @@ jobs:
         with:
           submodules: ${{ github.event.inputs.submodules == 'true' && 'recursive' || 'false' }}
           persist-credentials: false
+
+      - name: Resolve triplet
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
+            echo "TRIPLET=arm64-osx" >> "$GITHUB_ENV"
+          else
+            echo "TRIPLET=x64-osx" >> "$GITHUB_ENV"
+          fi
 
       # ── cfg 守門（1/2）：target 必須是 macos ──
       - name: Assert target_os is macos
@@ -131,7 +137,7 @@ jobs:
         run: |
           set -euo pipefail
           ./target/ci-vcpkg/vcpkg install \
-            --triplet ${{ matrix.triplet }} \
+            --triplet "$TRIPLET" \
             --x-manifest-root=.github/vcpkg-macos \
             --x-install-root="$VCPKG_ROOT/installed" \
             --overlay-ports="${GITHUB_WORKSPACE}/target/ci-rustdesk/res/vcpkg"
@@ -155,7 +161,7 @@ jobs:
           {
             echo "target: ${{ matrix.target }}"
             echo "triplet: ${{ matrix.triplet }}"
-            echo "runner: ${{ matrix.os }}"
+            echo "runner: $(uname -m)"
             echo "hwcodec base: $(git rev-parse HEAD)"
             echo "vcpkg: $VCPKG_COMMIT"
             echo "ffmpeg overlay: ${{ steps.rustdesk-ports.outputs.commit }}"
