@@ -187,16 +187,18 @@ jobs:
           set -euo pipefail
           cargo +$MAC_RUST_TOOLCHAIN build --target ${{ matrix.target }} --lib 2>&1 | tail -40
 
-      # Only the tests we own. The lib test binary also contains bindgen 0.59's
-      # generated bindgen_test_layout_* tests, which panic with "null reference
-      # produced" (a non-unwinding panic -> SIGABRT) on this target/toolchain.
-      # That is pre-existing and unrelated; filter to the pixelbuffer module.
-      - name: cargo test (owned tests only)
+      # Run everything except bindgen 0.59's generated bindgen_test_layout_*
+      # tests: those build a null reference and abort the process with a
+      # non-unwinding panic ("null reference produced" -> SIGABRT) on this
+      # target/toolchain, which kills the test binary before the rest reports.
+      # That is pre-existing and unrelated to this branch - skip by name rather
+      # than filtering to one module, so new tests are picked up automatically.
+      - name: cargo test (all but generated layout tests)
         if: ${{ github.event.inputs.mode == 'full' }}
         run: |
           set -euo pipefail
           cargo +$MAC_RUST_TOOLCHAIN test --target ${{ matrix.target }} --lib -- \
-            ffmpeg_ram::pixelbuffer --nocapture 2>&1 | tail -40
+            --skip bindgen_test_layout --nocapture 2>&1 | tail -50
 
       - name: Record environment
         if: always()
