@@ -272,15 +272,15 @@ public:
 
     if ((ret = av_frame_make_writable(frame_)) != 0) {
       LOG_ERROR(std::string("av_frame_make_writable failed, ret = ") + av_err2str(ret));
-      return ret;
+      return HWCODEC_ERR_INPUT_REJECTED;
     }
     if ((ret = fill_frame(frame_, (uint8_t *)data, length, offset_)) != 0)
-      return ret;
+      return HWCODEC_ERR_INPUT_REJECTED;
     AVFrame *tmp_frame;
     if (hw_device_type_ != AV_HWDEVICE_TYPE_NONE) {
       if ((ret = av_hwframe_transfer_data(hw_frame_, frame_, 0)) < 0) {
         LOG_ERROR(std::string("av_hwframe_transfer_data failed, ret = ") + av_err2str(ret));
-        return ret;
+        return HWCODEC_ERR_INPUT_REJECTED;
       }
       tmp_frame = hw_frame_;
     } else {
@@ -342,7 +342,8 @@ private:
     frame->pts = ms;
     if ((ret = avcodec_send_frame(c_, frame)) < 0) {
       LOG_ERROR(std::string("avcodec_send_frame failed, ret = ") + av_err2str(ret));
-      return ret;
+      // Nothing was consumed, so the caller still owns this frame.
+      return HWCODEC_ERR_INPUT_REJECTED;
     }
 
     auto start = util::now();
@@ -363,7 +364,10 @@ private:
     }
   _exit:
     av_packet_unref(pkt_);
-    return encoded ? 0 : -1;
+    // No packet is not an error: the encoder is buffering, or the drain window
+    // expired. Distinguish it from a real failure so the caller can tell
+    // "keep feeding" apart from "give up".
+    return encoded ? HWCODEC_SUCCESS : HWCODEC_ERR_NO_PACKET;
   }
 
   int fill_frame(AVFrame *frame, uint8_t *data, int data_length,

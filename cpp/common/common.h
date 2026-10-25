@@ -51,6 +51,14 @@ enum HwcodecErrno {
   HWCODEC_SUCCESS = 0,
   HWCODEC_ERR_COMMON = -1,
   HWCODEC_ERR_HEVC_COULD_NOT_FIND_POC = -2,
+  // The encoder consumed the input but produced no packet (it is still
+  // buffering, or the drain timeout expired). This is a normal, non-fatal
+  // outcome: the caller should keep feeding frames.
+  HWCODEC_ERR_NO_PACKET = -3,
+  // The encoder refused the input and consumed nothing: the frame was never
+  // encoded, so the caller may retry the same frame (e.g. through the
+  // software path) without having lost it.
+  HWCODEC_ERR_INPUT_REJECTED = -4,
 };
 
 #endif // COMMON_H
