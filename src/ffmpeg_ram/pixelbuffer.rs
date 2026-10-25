@@ -114,8 +114,10 @@ impl Drop for PixelBufferFrame {
 // locks its own state queue).
 unsafe impl Send for PixelBufferFrame {}
 
+/// Real CoreVideo objects for tests: the ownership contract is only meaningful
+/// against an actual reference-counted `CVPixelBuffer`.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
 
     extern "C" {
@@ -127,19 +129,31 @@ mod tests {
             pixel_buffer_attributes: *const c_void,
             pixel_buffer_out: *mut *mut c_void,
         ) -> i32;
-        fn CFGetRetainCount(cf: *const c_void) -> isize;
+        pub fn CFGetRetainCount(cf: *const c_void) -> isize;
     }
 
     /// Create a real CVPixelBuffer of the requested format (null attributes).
-    fn create_buffer(pixfmt: u32) -> Option<*mut c_void> {
+    pub fn create_buffer(pixfmt: u32) -> Option<*mut c_void> {
         let mut raw: *mut c_void = std::ptr::null_mut();
-        let status = unsafe { CVPixelBufferCreate(std::ptr::null(), 16, 16, pixfmt, std::ptr::null(), &mut raw) };
+        let status =
+            unsafe { CVPixelBufferCreate(std::ptr::null(), 16, 16, pixfmt, std::ptr::null(), &mut raw) };
         if status == 0 && !raw.is_null() {
             Some(raw)
         } else {
             None
         }
     }
+
+    /// Release the reference returned by `create_buffer`.
+    pub fn release_buffer(raw: *mut c_void) {
+        unsafe { CVPixelBufferRelease(raw) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{create_buffer, release_buffer, CFGetRetainCount};
+    use super::*;
 
     fn descriptor(raw: *mut c_void, pixfmt: u32) -> FfiPixelBufferFrame {
         FfiPixelBufferFrame {
@@ -193,6 +207,6 @@ mod tests {
         assert_eq!(unsafe { CFGetRetainCount(raw) }, base, "drop must release the owned reference");
 
         // release the reference created by CVPixelBufferCreate itself
-        unsafe { CVPixelBufferRelease(raw) };
+        release_buffer(raw);
     }
 }
