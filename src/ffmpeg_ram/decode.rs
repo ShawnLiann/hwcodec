@@ -3,6 +3,14 @@ use super::Priority;
 use crate::common::TEST_TIMEOUT_MS;
 use crate::ffmpeg::{init_av_log, AVHWDeviceType::*};
 
+#[cfg(target_os = "macos")]
+use crate::ffmpeg_ram::{
+    ffmpeg_ram_set_pixelbuffer_callback,
+    pixelbuffer::{
+        is_direct_deliverable, PixelBufferFrame, PIXELBUFFER_ACCEPTED, PIXELBUFFER_REJECTED,
+    },
+    FfiPixelBufferFrame,
+};
 use crate::{
     common::DataFormat::*,
     ffmpeg::{AVHWDeviceType, AVPixelFormat},
@@ -55,9 +63,38 @@ impl std::fmt::Display for DecodeFrame {
     }
 }
 
+/// Per-decode output state. Also the `obj` handed to both the software
+/// callback and the pixel-buffer callback, so they share one transaction view:
+/// a software frame clears the pending GPU frame of the same call, which makes
+/// "last decoded frame wins" hold across mixed frames.
+pub struct DecodeOutput {
+    frames: Vec<DecodeFrame>,
+    #[cfg(target_os = "macos")]
+    pixelbuffer: Option<PixelBufferFrame>,
+}
+
+impl DecodeOutput {
+    fn new() -> Self {
+        Self {
+            frames: vec![],
+            #[cfg(target_os = "macos")]
+            pixelbuffer: None,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.frames.clear();
+        // Transaction boundary: never answer with a frame from a previous call.
+        #[cfg(target_os = "macos")]
+        {
+            self.pixelbuffer = None;
+        }
+    }
+}
+
 pub struct Decoder {
     codec: *mut c_void,
-    frames: *mut Vec<DecodeFrame>,
+    output: *mut DecodeOutput,
     pub ctx: DecodeContext,
 }
 
@@ -79,9 +116,12 @@ impl Decoder {
                 return Err(());
             }
 
+            #[cfg(target_os = "macos")]
+            ffmpeg_ram_set_pixelbuffer_callback(codec, Some(Decoder::pixelbuffer_callback));
+
             Ok(Decoder {
                 codec,
-                frames: Box::into_raw(Box::new(Vec::<DecodeFrame>::new())),
+                output: Box::into_raw(Box::new(DecodeOutput::new())),
                 ctx,
             })
         }
@@ -89,18 +129,19 @@ impl Decoder {
 
     pub fn decode(&mut self, packet: &[u8]) -> Result<&mut Vec<DecodeFrame>, i32> {
         unsafe {
-            (&mut *self.frames).clear();
+            let output = &mut *self.output;
+            output.clear();
             let ret = ffmpeg_ram_decode(
                 self.codec,
                 packet.as_ptr(),
                 packet.len() as c_int,
-                self.frames as *const _ as *const c_void,
+                self.output as *const _ as *const c_void,
             );
 
             if ret < 0 {
                 Err(ret)
             } else {
-                Ok(&mut *self.frames)
+                Ok(&mut output.frames)
             }
         }
     }
@@ -114,7 +155,7 @@ impl Decoder {
         datas: *mut *mut u8,
         key: c_int,
     ) {
-        let frames = &mut *(obj as *mut Vec<DecodeFrame>);
+        let output = &mut *(obj as *mut DecodeOutput);
         let datas = from_raw_parts(datas, AV_NUM_DATA_POINTERS as _);
         let linesizes = from_raw_parts(linesizes, AV_NUM_DATA_POINTERS as _);
 
@@ -140,7 +181,12 @@ impl Decoder {
             frame.linesize.push(linesizes[1]);
             frame.linesize.push(linesizes[2]);
 
-            frames.push(frame);
+            // A software frame wins over a GPU frame of the same transaction.
+            #[cfg(target_os = "macos")]
+            {
+                output.pixelbuffer = None;
+            }
+            output.frames.push(frame);
         } else if pixfmt == AVPixelFormat::AV_PIX_FMT_NV12 as c_int {
             let y = from_raw_parts(datas[0], (linesizes[0] * height) as usize).to_vec();
             let uv = from_raw_parts(datas[1], (linesizes[1] * height / 2) as usize).to_vec();
@@ -151,9 +197,58 @@ impl Decoder {
             frame.linesize.push(linesizes[0]);
             frame.linesize.push(linesizes[1]);
 
-            frames.push(frame);
+            // A software frame wins over a GPU frame of the same transaction.
+            #[cfg(target_os = "macos")]
+            {
+                output.pixelbuffer = None;
+            }
+            output.frames.push(frame);
         } else {
             error!("unsupported pixfmt {}", pixfmt as i32);
+        }
+    }
+
+    /// Take the GPU frame delivered to this decode call, if any.
+    ///
+    /// `None` means this call produced no direct frame: either the decoder
+    /// rejected it, the format is not directly deliverable, or a software frame
+    /// won in the same transaction. The caller must not fall back to a frame
+    /// from a previous call.
+    #[cfg(target_os = "macos")]
+    pub fn take_pixelbuffer(&mut self) -> Option<PixelBufferFrame> {
+        unsafe { (&mut *self.output).pixelbuffer.take() }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn has_pixelbuffer(&self) -> bool {
+        unsafe { (&*self.output).pixelbuffer.is_some() }
+    }
+
+    /// Borrowed-descriptor callback from the decoder.
+    ///
+    /// Accepting means "retained and stored"; rejecting means "nothing kept",
+    /// so the decoder delivers the same decoded frame through the software
+    /// path. This must never panic: a panic across the FFI boundary aborts the
+    /// process in release builds (`panic = "abort"`).
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" fn pixelbuffer_callback(
+        obj: *mut c_void,
+        frame: *const FfiPixelBufferFrame,
+    ) -> c_int {
+        if obj.is_null() || frame.is_null() {
+            return PIXELBUFFER_REJECTED;
+        }
+        let frame = &*frame;
+        if !is_direct_deliverable(frame.pixfmt) || frame.pixel_buffer.is_null() {
+            return PIXELBUFFER_REJECTED;
+        }
+        let output = &mut *(obj as *mut DecodeOutput);
+        match PixelBufferFrame::retain_from_borrowed(frame) {
+            Some(pixelbuffer) => {
+                output.pixelbuffer = Some(pixelbuffer);
+                PIXELBUFFER_ACCEPTED
+            }
+            None => PIXELBUFFER_REJECTED,
         }
     }
 
@@ -330,9 +425,13 @@ impl Decoder {
 impl Drop for Decoder {
     fn drop(&mut self) {
         unsafe {
+            // Remove the callback first: after this no callback can reach the
+            // output state, so freeing it below cannot race a decode.
+            #[cfg(target_os = "macos")]
+            ffmpeg_ram_set_pixelbuffer_callback(self.codec, None);
             ffmpeg_ram_free_decoder(self.codec);
             self.codec = std::ptr::null_mut();
-            let _ = Box::from_raw(self.frames);
+            let _ = Box::from_raw(self.output);
         }
     }
 }
