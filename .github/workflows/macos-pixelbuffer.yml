@@ -127,6 +127,14 @@ jobs:
           path: target/vcpkg-cache
           key: macos-pb-${{ matrix.target }}-${{ env.VCPKG_COMMIT }}-${{ steps.rustdesk-ports.outputs.commit }}
 
+      - name: Install nasm (ffmpeg x86_64 asm)
+        run: |
+          set -euo pipefail
+          if ! command -v nasm >/dev/null 2>&1; then
+            HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install nasm
+          fi
+          nasm -v
+
       - name: Bootstrap vcpkg
         run: |
           set -euo pipefail
