@@ -43,11 +43,13 @@ env:
   VCPKG_ROOT: ${{ github.workspace }}/target/ci-vcpkg
   VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/target/vcpkg-cache,readwrite
   CARGO_TERM_COLOR: always
-  # hwcodec 在 macOS 上以 bindgen 0.59 產生 mux_ffi.rs，其中對 pthread 型別的
-  # offsetof 寫法（&(*(ptr::null::<_opaque_pthread_t>())).field）在較新的 rustc
-  # 是硬錯誤（deref_nullptr）。rustdesk 自己的 macOS CI 因此釘在 1.81
-  # （.github/workflows/flutter-build.yml: MAC_RUST_VERSION: "1.81"），我們照釘。
-  MAC_RUST_TOOLCHAIN: "1.81"
+  # hwcodec 以 bindgen 0.59 產生 mux_ffi.rs，其中的 offsetof 寫法
+  # （&(*(ptr::null::<_opaque_pthread_t>())).field）在新版 rustc 會觸發
+  # deref_nullptr（deny by default）。二條路：(a) 像 rustdesk CI 釘 Rust 1.81，
+  # 但本 repo 沒有 Cargo.lock，1.81 的 cargo 解析到需要 edition2024 的 crate 會失敗；
+  # (b) 用 stable 並放行該 lint（已在本機 rustc 1.99.1 驗證可行）。本 workflow 採 (b)。
+  MAC_RUST_TOOLCHAIN: "stable"
+  RUSTFLAGS: "-A deref_nullptr"
 
 jobs:
   macos:
