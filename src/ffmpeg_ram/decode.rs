@@ -208,6 +208,15 @@ impl Decoder {
         }
     }
 
+    /// The software frames produced by the last `decode()` call.
+    ///
+    /// Use this instead of the `decode()` return value when the caller must
+    /// also read [`Self::take_pixelbuffer`]: `decode()` returns a mutable borrow
+    /// of the decoder, so the two cannot overlap.
+    pub fn last_frames(&self) -> &[DecodeFrame] {
+        unsafe { &(*self.output).frames }
+    }
+
     /// Take the GPU frame delivered to this decode call, if any.
     ///
     /// `None` means this call produced no direct frame: either the decoder
