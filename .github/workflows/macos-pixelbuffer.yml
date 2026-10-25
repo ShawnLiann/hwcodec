@@ -1,0 +1,164 @@
+name: macOS pixelbuffer
+
+# macOS（Intel + Apple Silicon）建置與測試。
+# 目的：
+#   1) 提供 cargo check 的 fast lane，讓迭代不用等 vcpkg 全量 build
+#   2) 在加新 API 之前，先證明 hwcodec 能在兩個 arch 上以 rustdesk 的 ffmpeg overlay 編過
+#   3) 加上 cfg 守門（防止把 target_os 誤寫成 "darwin"）
+#
+# 觸發方式：
+#   - push 到 feat/macos-pixelbuffer（預設只跑 x86_64，省時間）
+#   - workflow_dispatch：可指定 archs 與 mode
+
+on:
+  workflow_dispatch:
+    inputs:
+      archs:
+        description: 'JSON array of Rust targets, e.g. ["x86_64-apple-darwin"] or both'
+        type: string
+        default: '["x86_64-apple-darwin"]'
+      mode:
+        description: 'fast = cargo check, full = cargo build + test'
+        type: choice
+        options: [fast, full]
+        default: fast
+      submodules:
+        description: 'checkout submodules (recursive) — not needed on macOS'
+        type: boolean
+        default: false
+  push:
+    branches: [feat/macos-pixelbuffer]
+    paths-ignore:
+      - '**.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VCPKG_COMMIT: 120deac3062162151622ca4860575a33844ba10b
+  VCPKG_ROOT: ${{ github.workspace }}/target/ci-vcpkg
+  VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/target/vcpkg-cache,readwrite
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: ${{ matrix.target }} / ${{ github.event.inputs.mode || 'fast' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-apple-darwin,  os: macos-15-intel, triplet: x64-osx }
+          - { target: aarch64-apple-darwin, os: macos-14,       triplet: arm64-osx }
+    # push 事件沒有 inputs → 預設只跑 x86_64
+    if: ${{ contains(github.event.inputs.archs || '["x86_64-apple-darwin"]', matrix.target) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout hwcodec
+        uses: actions/checkout@v4
+        with:
+          submodules: ${{ github.event.inputs.submodules == 'true' && 'recursive' || 'false' }}
+          persist-credentials: false
+
+      # ── cfg 守門（1/2）：target 必須是 macos ──
+      - name: Assert target_os is macos
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustc --print cfg --target ${{ matrix.target }} | grep -qx 'target_os="macos"' \
+            || { echo "FAIL: target_os is not macos for ${{ matrix.target }}"; exit 1; }
+          echo "OK: target_os=macos"
+
+      # ── cfg 守門（2/2）：來源檔不得出現無效的 darwin cfg ──
+      - name: Scan sources for invalid cfg (darwin)
+        run: |
+          set -uo pipefail
+          status=0
+          grep -rnE 'target_os[[:space:]]*=[[:space:]]*"darwin"' src cpp || status=$?
+          case "$status" in
+            0) echo 'FAIL: invalid cfg target_os="darwin" found (Rust uses "macos")'; exit 1 ;;
+            1) echo 'OK: no invalid darwin cfg' ;;
+            *) echo "FAIL: cfg scan execution error (status=$status)"; exit "$status" ;;
+          esac
+
+      - name: Resolve libclang path (bindgen)
+        id: libclang
+        run: |
+          set -euo pipefail
+          DEV=$(xcode-select -p)
+          echo "LIBCLANG_PATH=$DEV/Toolchains/XcodeDefault.xctoolchain/usr/lib" >> "$GITHUB_ENV"
+          ls "$DEV/Toolchains/XcodeDefault.xctoolchain/usr/lib/libclang.dylib" >/dev/null
+          echo "OK: libclang found"
+
+      - name: Checkout vcpkg (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/vcpkg
+          ref: ${{ env.VCPKG_COMMIT }}
+          path: target/ci-vcpkg
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout rustdesk ffmpeg overlay port
+        id: rustdesk-ports
+        uses: actions/checkout@v4
+        with:
+          repository: rustdesk/rustdesk
+          path: target/ci-rustdesk
+          sparse-checkout: |
+            res/vcpkg/ffmpeg
+            res/vcpkg/mfx-dispatch
+          persist-credentials: false
+
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: target/vcpkg-cache
+          key: macos-pb-${{ matrix.target }}-${{ env.VCPKG_COMMIT }}-${{ steps.rustdesk-ports.outputs.commit }}
+
+      - name: Bootstrap vcpkg
+        run: |
+          set -euo pipefail
+          mkdir -p target/vcpkg-cache
+          ./target/ci-vcpkg/bootstrap-vcpkg.sh -disableMetrics
+
+      - name: Install ffmpeg (rustdesk overlay, videotoolbox)
+        run: |
+          set -euo pipefail
+          ./target/ci-vcpkg/vcpkg install \
+            --triplet ${{ matrix.triplet }} \
+            --x-manifest-root=.github/vcpkg-macos \
+            --x-install-root="$VCPKG_ROOT/installed" \
+            --overlay-ports="${GITHUB_WORKSPACE}/target/ci-rustdesk/res/vcpkg"
+
+      - name: cargo check (fast lane)
+        if: ${{ (github.event.inputs.mode || 'fast') == 'fast' }}
+        run: |
+          set -euo pipefail
+          cargo check --target ${{ matrix.target }} --all-targets 2>&1 | tail -40
+
+      - name: cargo build + test (full)
+        if: ${{ github.event.inputs.mode == 'full' }}
+        run: |
+          set -euo pipefail
+          cargo build --target ${{ matrix.target }} 2>&1 | tail -40
+          cargo test  --target ${{ matrix.target }} -- --nocapture 2>&1 | tail -60
+
+      - name: Record environment
+        if: always()
+        run: |
+          {
+            echo "target: ${{ matrix.target }}"
+            echo "triplet: ${{ matrix.triplet }}"
+            echo "runner: ${{ matrix.os }}"
+            echo "hwcodec base: $(git rev-parse HEAD)"
+            echo "vcpkg: $VCPKG_COMMIT"
+            echo "ffmpeg overlay: ${{ steps.rustdesk-ports.outputs.commit }}"
+            rustc -V
+            cargo -V
+          } | tee env.txt
