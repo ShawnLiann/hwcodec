@@ -24,9 +24,36 @@ use std::{
     ffi::{c_void, CString},
     os::raw::c_int,
     slice::from_raw_parts,
+    sync::atomic::{AtomicBool, Ordering},
     time::Instant,
     vec,
 };
+
+/// Whether decoded GPU frames should be taken over by the renderer.
+///
+/// The C++ decoder only skips its software transfer when the pixel buffer
+/// callback accepts the frame *during* the decode call, so the decision has to
+/// be reachable from here rather than after the fact: a frame that is accepted
+/// and then dropped on the Rust side would leave the renderer with nothing to
+/// paint and freeze the picture.  The app turns this off when it cannot present
+/// GPU frames (texture render off, direct path disabled, or the loaded plugin
+/// has no entry point), and then decode behaves exactly like the software path.
+#[cfg(target_os = "macos")]
+static PIXELBUFFER_WANTED: AtomicBool = AtomicBool::new(true);
+
+/// Ask the decoder to hand out GPU frames (or stop doing so).
+///
+/// Takes effect on the next decoded frame; safe to call from any thread.
+#[cfg(target_os = "macos")]
+pub fn set_pixelbuffer_wanted(wanted: bool) {
+    PIXELBUFFER_WANTED.store(wanted, Ordering::Relaxed);
+}
+
+/// Current value of [`set_pixelbuffer_wanted`].
+#[cfg(target_os = "macos")]
+pub fn pixelbuffer_wanted() -> bool {
+    PIXELBUFFER_WANTED.load(Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone)]
 pub struct DecodeContext {
@@ -245,6 +272,12 @@ impl Decoder {
         frame: *const FfiPixelBufferFrame,
     ) -> c_int {
         if obj.is_null() || frame.is_null() {
+            return PIXELBUFFER_REJECTED;
+        }
+        // Rejecting here is what makes the C++ side fall back to its software
+        // transfer on this very frame, so the renderer never has a frame taken
+        // away from it.
+        if !pixelbuffer_wanted() {
             return PIXELBUFFER_REJECTED;
         }
         let frame = &*frame;
