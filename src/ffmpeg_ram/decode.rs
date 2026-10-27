@@ -24,36 +24,13 @@ use std::{
     ffi::{c_void, CString},
     os::raw::c_int,
     slice::from_raw_parts,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Instant,
     vec,
 };
-
-/// Whether decoded GPU frames should be taken over by the renderer.
-///
-/// The C++ decoder only skips its software transfer when the pixel buffer
-/// callback accepts the frame *during* the decode call, so the decision has to
-/// be reachable from here rather than after the fact: a frame that is accepted
-/// and then dropped on the Rust side would leave the renderer with nothing to
-/// paint and freeze the picture.  The app turns this off when it cannot present
-/// GPU frames (texture render off, direct path disabled, or the loaded plugin
-/// has no entry point), and then decode behaves exactly like the software path.
-#[cfg(target_os = "macos")]
-static PIXELBUFFER_WANTED: AtomicBool = AtomicBool::new(true);
-
-/// Ask the decoder to hand out GPU frames (or stop doing so).
-///
-/// Takes effect on the next decoded frame; safe to call from any thread.
-#[cfg(target_os = "macos")]
-pub fn set_pixelbuffer_wanted(wanted: bool) {
-    PIXELBUFFER_WANTED.store(wanted, Ordering::Relaxed);
-}
-
-/// Current value of [`set_pixelbuffer_wanted`].
-#[cfg(target_os = "macos")]
-pub fn pixelbuffer_wanted() -> bool {
-    PIXELBUFFER_WANTED.load(Ordering::Relaxed)
-}
 
 #[derive(Debug, Clone)]
 pub struct DecodeContext {
@@ -98,6 +75,14 @@ pub struct DecodeOutput {
     frames: Vec<DecodeFrame>,
     #[cfg(target_os = "macos")]
     pixelbuffer: Option<PixelBufferFrame>,
+    /// The caller's "can you present GPU frames" flag, shared by reference so
+    /// the answer can change between frames without touching the decoder.
+    ///
+    /// `None` means the caller never asked for GPU frames, and the callback then
+    /// rejects every frame: delivery is opt-in, because accepting one makes the
+    /// decoder skip the software transfer for that frame.
+    #[cfg(target_os = "macos")]
+    pixelbuffer_wanted: Option<Arc<AtomicBool>>,
 }
 
 impl DecodeOutput {
@@ -106,6 +91,8 @@ impl DecodeOutput {
             frames: vec![],
             #[cfg(target_os = "macos")]
             pixelbuffer: None,
+            #[cfg(target_os = "macos")]
+            pixelbuffer_wanted: None,
         }
     }
 
@@ -260,6 +247,23 @@ impl Decoder {
         unsafe { (&*self.output).pixelbuffer.is_some() }
     }
 
+    /// Share the caller's "can you present GPU frames" flag with this decoder.
+    ///
+    /// The C++ decoder only skips its software transfer when the pixel buffer
+    /// callback accepts a frame *during* the decode call, so the decision has to
+    /// be taken there rather than after the fact: a frame accepted here and
+    /// dropped further up leaves the renderer with neither a GPU frame nor a
+    /// software one.  Rejecting here makes the decoder fall back to the software
+    /// transfer on that very frame.
+    ///
+    /// Taking the flag by reference (instead of a plain bool) means the caller
+    /// can flip it at any time, e.g. when the user switches the render path, and
+    /// the change applies from the next decoded frame.
+    #[cfg(target_os = "macos")]
+    pub fn set_pixelbuffer_wanted(&mut self, wanted: Arc<AtomicBool>) {
+        unsafe { (&mut *self.output).pixelbuffer_wanted = Some(wanted) };
+    }
+
     /// Borrowed-descriptor callback from the decoder.
     ///
     /// Accepting means "retained and stored"; rejecting means "nothing kept",
@@ -274,17 +278,23 @@ impl Decoder {
         if obj.is_null() || frame.is_null() {
             return PIXELBUFFER_REJECTED;
         }
+        let output = &mut *(obj as *mut DecodeOutput);
         // Rejecting here is what makes the C++ side fall back to its software
         // transfer on this very frame, so the renderer never has a frame taken
         // away from it.
-        if !pixelbuffer_wanted() {
+        //
+        // Delivery is opt-in: a decoder the caller never configured keeps
+        // producing software frames, exactly like before this API existed.
+        let Some(wanted) = &output.pixelbuffer_wanted else {
+            return PIXELBUFFER_REJECTED;
+        };
+        if !wanted.load(Ordering::Relaxed) {
             return PIXELBUFFER_REJECTED;
         }
         let frame = &*frame;
         if !is_direct_deliverable(frame.pixfmt) || frame.pixel_buffer.is_null() {
             return PIXELBUFFER_REJECTED;
         }
-        let output = &mut *(obj as *mut DecodeOutput);
         match PixelBufferFrame::retain_from_borrowed(frame) {
             Some(pixelbuffer) => {
                 output.pixelbuffer = Some(pixelbuffer);
@@ -493,6 +503,14 @@ mod output_tests {
     const W: i32 = 16;
     const H: i32 = 16;
 
+    /// An output that asked for GPU frames; delivery is opt-in, so a bare
+    /// `DecodeOutput::new()` would reject everything.
+    fn output_wanting_gpu(wanted: bool) -> DecodeOutput {
+        let mut output = DecodeOutput::new();
+        output.pixelbuffer_wanted = Some(std::sync::Arc::new(AtomicBool::new(wanted)));
+        output
+    }
+
     /// Push one software (NV12) frame through the real callback.
     fn software_frame(output: &mut DecodeOutput) {
         let mut y = vec![0u8; (W * H) as usize];
@@ -528,12 +546,51 @@ mod output_tests {
     }
 
     #[test]
-    fn software_then_direct_keeps_the_gpu_frame() {
+    fn unconfigured_decoder_rejects_gpu_frames() {
+        // Opt-in: a decoder the caller never configured must keep producing
+        // software frames, so it must refuse the surface even when it could
+        // deliver it. This is the regression that a Cargo.lock bump would
+        // otherwise push into every consumer.
         let Some(raw) = create_buffer(crate::ffmpeg_ram::pixelbuffer::PIXEL_FORMAT_420F) else {
             eprintln!("skip: CVPixelBufferCreate failed in this environment");
             return;
         };
         let mut output = DecodeOutput::new();
+        assert!(
+            output.pixelbuffer_wanted.is_none(),
+            "a decoder without a caller flag must not want GPU frames"
+        );
+        assert_eq!(
+            direct_frame(
+                &mut output,
+                crate::ffmpeg_ram::pixelbuffer::PIXEL_FORMAT_420F,
+                raw
+            ),
+            PIXELBUFFER_REJECTED
+        );
+        assert!(output.pixelbuffer.is_none(), "a rejected frame must retain nothing");
+
+        // ... and it accepts once the caller says it can present them.
+        output.pixelbuffer_wanted = Some(std::sync::Arc::new(AtomicBool::new(true)));
+        assert_eq!(
+            direct_frame(
+                &mut output,
+                crate::ffmpeg_ram::pixelbuffer::PIXEL_FORMAT_420F,
+                raw
+            ),
+            PIXELBUFFER_ACCEPTED
+        );
+        assert!(output.pixelbuffer.is_some());
+        release_buffer(raw);
+    }
+
+    #[test]
+    fn software_then_direct_keeps_the_gpu_frame() {
+        let Some(raw) = create_buffer(crate::ffmpeg_ram::pixelbuffer::PIXEL_FORMAT_420F) else {
+            eprintln!("skip: CVPixelBufferCreate failed in this environment");
+            return;
+        };
+        let mut output = output_wanting_gpu(true);
         software_frame(&mut output);
         assert_eq!(output.frames.len(), 1);
         assert!(output.pixelbuffer.is_none());
@@ -562,7 +619,7 @@ mod output_tests {
             eprintln!("skip: CVPixelBufferCreate failed in this environment");
             return;
         };
-        let mut output = DecodeOutput::new();
+        let mut output = output_wanting_gpu(true);
         assert_eq!(
             direct_frame(
                 &mut output,
@@ -588,7 +645,7 @@ mod output_tests {
             eprintln!("skip: CVPixelBufferCreate failed in this environment");
             return;
         };
-        let mut output = DecodeOutput::new();
+        let mut output = output_wanting_gpu(true);
         assert_eq!(direct_frame(&mut output, 0x4247_5241, raw), PIXELBUFFER_REJECTED);
         assert!(output.pixelbuffer.is_none(), "a rejected frame must retain nothing");
         release_buffer(raw);
@@ -596,7 +653,7 @@ mod output_tests {
 
     #[test]
     fn null_descriptor_is_rejected() {
-        let mut output = DecodeOutput::new();
+        let mut output = output_wanting_gpu(true);
         assert_eq!(
             direct_frame(
                 &mut output,
@@ -626,7 +683,7 @@ mod output_tests {
             eprintln!("skip: CVPixelBufferCreate failed in this environment");
             return;
         };
-        let mut output = DecodeOutput::new();
+        let mut output = output_wanting_gpu(true);
         assert_eq!(
             direct_frame(
                 &mut output,

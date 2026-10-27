@@ -16,8 +16,6 @@ pub mod decode;
 pub mod encode;
 #[cfg(target_os = "macos")]
 pub mod pixelbuffer;
-#[cfg(target_os = "macos")]
-pub use decode::{pixelbuffer_wanted, set_pixelbuffer_wanted};
 
 pub enum Priority {
     Best = 0,
