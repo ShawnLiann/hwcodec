@@ -411,12 +411,15 @@ extern "C" int ffmpeg_ram_decode(FFmpegRamDecoder *decoder, const uint8_t *data,
  * synchronized against a concurrent decode() - the owner-serialized lifetime
  * keeps the callback context alive, so no locking is needed here. */
 extern "C" void ffmpeg_ram_set_pixelbuffer_callback(
-    FFmpegRamDecoder *decoder, void *callback) {
+    void *decoder, RamPixelBufferCallback callback) {
 #ifdef HWCODEC_HAVE_PIXELBUFFER
   if (decoder == NULL) {
     return;
   }
-  decoder->set_pixelbuffer_callback((RamPixelBufferCallback)callback);
+  /* Object pointer to object pointer: the header hands us `void *` so the symbol
+   * stays callable from Rust, where the decoder handle is opaque. The callback is
+   * NOT cast: it is a function pointer on both sides of the boundary. */
+  static_cast<FFmpegRamDecoder *>(decoder)->set_pixelbuffer_callback(callback);
 #else
   (void)decoder;
   (void)callback;
