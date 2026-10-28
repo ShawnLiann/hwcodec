@@ -176,9 +176,51 @@ impl Decoder {
         datas: *mut *mut u8,
         key: c_int,
     ) {
+        // A panic here aborts the process: the release profile is `panic = "abort"`,
+        // so `catch_unwind` would be inert and this callback has to be non-panicking
+        // by construction. That means validating every pointer and length the C side
+        // hands over before building a slice from it -- `from_raw_parts` on a null
+        // pointer, or on a negative linesize cast to usize, is undefined behaviour
+        // rather than a panic, and no unwinding story would catch it either.
+        if obj.is_null() || datas.is_null() || linesizes.is_null() {
+            error!("decode callback got a null object or plane array");
+            return;
+        }
+        if width <= 0 || height <= 0 {
+            error!(
+                "decode callback got a non-positive frame size {}x{}",
+                width, height
+            );
+            return;
+        }
+
         let output = &mut *(obj as *mut DecodeOutput);
         let datas = from_raw_parts(datas, AV_NUM_DATA_POINTERS as _);
         let linesizes = from_raw_parts(linesizes, AV_NUM_DATA_POINTERS as _);
+
+        // Every plane this format reads is dereferenced below, so validate the
+        // pointer and the stride first: a null plane or a non-positive stride is a
+        // producer bug, and dropping the frame beats reading unmapped memory.
+        let planes = if pixfmt == AVPixelFormat::AV_PIX_FMT_YUV420P as c_int {
+            3
+        } else if pixfmt == AVPixelFormat::AV_PIX_FMT_NV12 as c_int {
+            2
+        } else {
+            0
+        };
+        for i in 0..planes {
+            if datas[i].is_null() {
+                error!("decode callback got a null plane {}", i);
+                return;
+            }
+            if linesizes[i] <= 0 {
+                error!(
+                    "decode callback got a non-positive linesize {} on plane {}",
+                    linesizes[i], i
+                );
+                return;
+            }
+        }
 
         let mut frame = DecodeFrame {
             pixfmt: std::mem::transmute(pixfmt),
@@ -575,7 +617,10 @@ mod output_tests {
             ),
             PIXELBUFFER_REJECTED
         );
-        assert!(output.pixelbuffer.is_none(), "a rejected frame must retain nothing");
+        assert!(
+            output.pixelbuffer.is_none(),
+            "a rejected frame must retain nothing"
+        );
 
         // ... and it accepts once the caller says it can present them.
         output.pixelbuffer_wanted = Some(std::sync::Arc::new(AtomicBool::new(true)));
@@ -612,7 +657,11 @@ mod output_tests {
         );
         // The GPU frame arrived last, so it is the output of this call.
         assert!(output.pixelbuffer.is_some());
-        assert_eq!(output.frames.len(), 1, "software frames are not cleared by a GPU frame");
+        assert_eq!(
+            output.frames.len(),
+            1,
+            "software frames are not cleared by a GPU frame"
+        );
 
         output.clear();
         assert!(output.pixelbuffer.is_none());
@@ -653,8 +702,14 @@ mod output_tests {
             return;
         };
         let mut output = output_wanting_gpu(true);
-        assert_eq!(direct_frame(&mut output, 0x4247_5241, raw), PIXELBUFFER_REJECTED);
-        assert!(output.pixelbuffer.is_none(), "a rejected frame must retain nothing");
+        assert_eq!(
+            direct_frame(&mut output, 0x4247_5241, raw),
+            PIXELBUFFER_REJECTED
+        );
+        assert!(
+            output.pixelbuffer.is_none(),
+            "a rejected frame must retain nothing"
+        );
         release_buffer(raw);
     }
 
