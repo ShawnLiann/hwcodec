@@ -142,20 +142,27 @@ impl Decoder {
     }
 
     pub fn decode(&mut self, packet: &[u8]) -> Result<&mut Vec<DecodeFrame>, i32> {
+        // No `&mut DecodeOutput` may be alive while `ffmpeg_ram_decode` runs: the C
+        // side calls `callback` synchronously, and that callback reaches this same
+        // allocation through the raw pointer and takes its own reference to it.
+        // Two live `&mut`s to one object violate the aliasing rules even when one
+        // thread touches both, so the clear and the read each borrow through the
+        // raw pointer for the length of a statement, and the FFI call runs with no
+        // borrow alive at all.
+        let output = self.output;
         unsafe {
-            let output = &mut *self.output;
-            output.clear();
+            (*output).clear();
             let ret = ffmpeg_ram_decode(
                 self.codec,
                 packet.as_ptr(),
                 packet.len() as c_int,
-                self.output as *const _ as *const c_void,
+                output as *const c_void,
             );
 
             if ret < 0 {
                 Err(ret)
             } else {
-                Ok(&mut output.frames)
+                Ok(&mut (*output).frames)
             }
         }
     }
