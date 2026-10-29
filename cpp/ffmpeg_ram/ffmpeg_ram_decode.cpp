@@ -40,9 +40,16 @@ typedef void (*RamDecodeCallback)(const void *obj, int width, int height,
                                   int linesize[AV_NUM_DATA_POINTERS],
                                   uint8_t *data[AV_NUM_DATA_POINTERS], int key);
 
-#ifdef HWCODEC_HAVE_PIXELBUFFER
 /* Kept in sync with cpp/ffmpeg_ram/ffmpeg_ram_ffi.h. Declared locally because
- * this translation unit has its own RamDecodeCallback typedef. */
+ * this translation unit has its own RamDecodeCallback typedef.
+ *
+ * The frame struct and the callback typedef are deliberately declared on every
+ * platform, not only under HWCODEC_HAVE_PIXELBUFFER: the exported setter below
+ * takes a RamPixelBufferCallback in its signature on all targets (its body is a
+ * no-op where no pixel buffer exists), and MSVC rejects that signature with
+ * C2061 when the type is only declared inside the Apple guard. Nothing here
+ * depends on CoreVideo - the pixfmt constants used to compare against live in
+ * is_direct_deliverable, which stays guarded. */
 #define PIXELBUFFER_REJECTED 0
 #define PIXELBUFFER_ACCEPTED 1
 struct FfiPixelBufferFrame {
@@ -54,6 +61,7 @@ struct FfiPixelBufferFrame {
 typedef int32_t (*RamPixelBufferCallback)(void *obj,
                                           const FfiPixelBufferFrame *frame);
 
+#ifdef HWCODEC_HAVE_PIXELBUFFER
 static bool is_direct_deliverable(uint32_t pixfmt) {
   return pixfmt == (uint32_t)kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
          pixfmt == (uint32_t)kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
