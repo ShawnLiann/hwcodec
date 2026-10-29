@@ -1,4 +1,4 @@
-name: check windows + linux
+name: check windows + linux + macos
 
 # Test-only infrastructure that lives on the fork's default branch, never in a PR.
 # Why it exists: hwcodec's C++ is compiled by every target, but this repo's CI only
@@ -155,6 +155,47 @@ jobs:
             done
           done
           ls -1 "$VCPKG_ROOT/installed/$triplet/include" | head
+
+      - name: cargo check (compiles the C++ through build.rs)
+        run: cargo check --lib
+
+  macos-arm64:
+    # macOS is the only target where HWCODEC_HAVE_PIXELBUFFER is defined, i.e. the only
+    # place the guarded half of the pixel-buffer code is compiled at all.
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/target/ci-vcpkg
+    steps:
+      - name: Resolve ref
+        id: target
+        run: |
+          r="${{ github.event.inputs.ref }}"
+          [ -n "$r" ] || r="${{ github.ref_name }}"
+          echo "ref=$r" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.ref }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install FFmpeg headers
+        run: brew install pkgconf ffmpeg || brew upgrade ffmpeg
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # build.rs wants $VCPKG_ROOT/installed/<triplet>/include; the triplet on macOS is
+      # x64-osx / arm64-osx. `cargo check` does not link, so headers are enough.
+      - name: Fake the vcpkg install layout for headers only
+        run: |
+          if [ "$(uname -m)" = "arm64" ]; then triplet=arm64-osx; else triplet=x64-osx; fi
+          prefix=$(brew --prefix)
+          mkdir -p "$VCPKG_ROOT/installed/$triplet/include" "$VCPKG_ROOT/installed/$triplet/lib"
+          for h in libavcodec libavutil libavformat libswscale libavfilter libavdevice libswresample; do
+            [ -d "$prefix/include/$h" ] && ln -sfn "$prefix/include/$h" "$VCPKG_ROOT/installed/$triplet/include/$h"
+          done
+          ls -1 "$VCPKG_ROOT/installed/$triplet/include"
 
       - name: cargo check (compiles the C++ through build.rs)
         run: cargo check --lib
