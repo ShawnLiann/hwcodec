@@ -4,8 +4,10 @@ name: check windows + linux
 # Why it exists: hwcodec's C++ is compiled by every target, but this repo's CI only
 # ever built macOS. A type declared behind the macOS-only HWCODEC_HAVE_PIXELBUFFER
 # guard therefore broke Windows x64 (C2061) and Linux without anyone seeing it.
-# `cargo check` runs build.rs, and build.rs compiles the C++ through the `cc` crate,
-# so this catches that class of breakage without linking a full binary.
+# `cargo check --lib` runs build.rs, and build.rs compiles the C++ through the `cc` crate,
+# so this catches that class of breakage without linking a full binary. Deliberately not
+# --all-targets: tests/examples of this repo carry unrelated, pre-existing failures
+# (deref_nullptr lints, the `vram`-gated example) that would mask the signal.
 #
 #   gh workflow run check-windows-linux.yml -R ShawnLiann/hwcodec \
 #      --ref <branch> -f ref=<branch>
@@ -109,7 +111,7 @@ jobs:
           & "$vs/Common7/Tools/Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
           $env:VCPKG_ROOT = "$env:GITHUB_WORKSPACE/target/ci-vcpkg"
           $env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
-          cargo check --all-targets
+          cargo check --lib
           if ($LASTEXITCODE -ne 0) { throw 'cargo check failed on windows' }
 
   linux-gcc:
@@ -155,4 +157,4 @@ jobs:
           ls -1 "$VCPKG_ROOT/installed/$triplet/include" | head
 
       - name: cargo check (compiles the C++ through build.rs)
-        run: cargo check --all-targets
+        run: cargo check --lib
