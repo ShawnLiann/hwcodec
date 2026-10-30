@@ -212,3 +212,10 @@ jobs:
 
       - name: cargo check (compiles the C++ through build.rs)
         run: cargo check --lib
+
+      # `cargo check --lib` never compiles `#[cfg(test)]`, so the unit tests of this module --
+      # including the ones that pin the surface hand-off contract -- would otherwise be dead
+      # weight. Restricted to this module: the rest of the repo's tests carry pre-existing
+      # failures that would mask the signal.
+      - name: unit tests of the pixel-buffer path
+        run: "cargo test --lib ffmpeg_ram:: -- --nocapture"
