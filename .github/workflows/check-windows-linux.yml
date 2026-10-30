@@ -218,7 +218,11 @@ jobs:
       # weight. Restricted to this module: the rest of the repo's tests carry pre-existing
       # failures that would mask the signal.
       - name: unit tests of the pixel-buffer path
-        # `deref_nullptr` fires inside bindgen's generated `mux_ffi.rs` (the opaque pthread
-        # types), which is a pre-existing condition of this repo and not this module's code.
-        run: 'RUSTFLAGS="-A deref_nullptr" cargo test --lib ffmpeg_ram:: -- --nocapture'
+        run: |
+          # `deref_nullptr` fires inside bindgen's generated `mux_ffi.rs` (opaque pthread types):
+          # pre-existing in this repo, unrelated to this module.
+          # `cargo check` never links, so this is the first step here that needs libavcodec
+          # itself; FFMPEG_PREFIX is the real brew install, so point the linker at it.
+          export RUSTFLAGS="-A deref_nullptr -L $FFMPEG_PREFIX/lib"
+          cargo test --lib ffmpeg_ram:: -- --nocapture
 
