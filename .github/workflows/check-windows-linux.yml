@@ -1,0 +1,214 @@
+name: check windows + linux + macos
+
+# Test-only infrastructure that lives on the fork's default branch, never in a PR.
+# Why it exists: hwcodec's C++ is compiled by every target, but this repo's CI only
+# ever built macOS. A type declared behind the macOS-only HWCODEC_HAVE_PIXELBUFFER
+# guard therefore broke Windows x64 (C2061) and Linux without anyone seeing it.
+# `cargo check --lib` runs build.rs, and build.rs compiles the C++ through the `cc` crate,
+# so this catches that class of breakage without linking a full binary. Deliberately not
+# --all-targets: tests/examples of this repo carry unrelated, pre-existing failures
+# (deref_nullptr lints, the `vram`-gated example) that would mask the signal.
+#
+#   gh workflow run check-windows-linux.yml -R ShawnLiann/hwcodec \
+#      --ref <branch> -f ref=<branch>
+#
+# Push triggers cover our working branches so a push is guarded automatically.
+
+on:
+  push:
+    branches: ['ci/**', 'fix/**']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: branch or sha to check (defaults to the dispatched ref)
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  VCPKG_COMMIT: 120deac3062162151622ca4860575a33844ba10b
+
+jobs:
+  windows-msvc:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/target/ci-vcpkg
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/target/vcpkg-cache,readwrite
+    steps:
+      - name: Resolve ref
+        id: target
+        run: |
+          $r = "${{ github.event.inputs.ref }}"
+          if (-not $r) { $r = "${{ github.ref_name }}" }
+          "ref=$r" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.ref }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Checkout vcpkg
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/vcpkg
+          ref: ${{ env.VCPKG_COMMIT }}
+          path: target/ci-vcpkg
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout FFmpeg and dispatcher ports
+        id: rustdesk-ports
+        uses: actions/checkout@v4
+        with:
+          repository: rustdesk/rustdesk
+          ref: master
+          path: target/ci-rustdesk
+          sparse-checkout: |
+            res/vcpkg/ffmpeg
+            res/vcpkg/mfx-dispatch
+          persist-credentials: false
+
+      - name: Prepare Rust and binary cache
+        id: environment
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw 'Installing Rust failed.' }
+          New-Item -ItemType Directory -Force target/vcpkg-cache | Out-Null
+          "image=$env:ImageVersion" >> $env:GITHUB_OUTPUT
+
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: target/vcpkg-cache
+          key: winlinux-${{ steps.environment.outputs.image }}-${{ env.VCPKG_COMMIT }}-${{ steps.rustdesk-ports.outputs.commit }}-${{ hashFiles('.github/vcpkg/vcpkg.json') }}
+
+      - name: Build FFmpeg dependencies
+        run: |
+          & "$env:VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw 'Bootstrapping vcpkg failed.' }
+          & "$env:VCPKG_ROOT/vcpkg.exe" install --triplet x64-windows-static `
+            "--x-manifest-root=$env:GITHUB_WORKSPACE/.github/vcpkg" `
+            "--x-install-root=$env:VCPKG_ROOT/installed" `
+            "--overlay-ports=$env:GITHUB_WORKSPACE/target/ci-rustdesk/res/vcpkg"
+          if ($LASTEXITCODE -ne 0) { throw 'Installing FFmpeg dependencies failed.' }
+
+      - name: cargo check (compiles the C++ through build.rs)
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'MSVC x64 tools are missing.' }
+          & "$vs/Common7/Tools/Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          $env:VCPKG_ROOT = "$env:GITHUB_WORKSPACE/target/ci-vcpkg"
+          $env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
+          cargo check --lib
+          if ($LASTEXITCODE -ne 0) { throw 'cargo check failed on windows' }
+
+  linux-gcc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/target/ci-vcpkg
+    steps:
+      - name: Resolve ref
+        id: target
+        run: |
+          r="${{ github.event.inputs.ref }}"
+          [ -n "$r" ] || r="${{ github.ref_name }}"
+          echo "ref=$r" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.ref }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install toolchain and FFmpeg headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake clang libclang-dev libc++-dev \
+            libavcodec-dev libavutil-dev libavformat-dev libswscale-dev \
+            libavfilter-dev libavdevice-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # build.rs insists on $VCPKG_ROOT/installed/<triplet>/include. `cargo check` does
+      # not link, so an empty lib/ is enough; the headers come from the distro packages.
+      - name: Fake the vcpkg install layout for headers only
+        run: |
+          triplet=x64-linux
+          mkdir -p "$VCPKG_ROOT/installed/$triplet/include" "$VCPKG_ROOT/installed/$triplet/lib"
+          for d in /usr/include/x86_64-linux-gnu /usr/include; do
+            for h in libavcodec libavutil libavformat libswscale libavfilter libavdevice; do
+              [ -d "$d/$h" ] && ln -sfn "$d/$h" "$VCPKG_ROOT/installed/$triplet/include/$h"
+            done
+          done
+          ls -1 "$VCPKG_ROOT/installed/$triplet/include" | head
+
+      - name: cargo check (compiles the C++ through build.rs)
+        run: cargo check --lib
+
+  macos-arm64:
+    # macOS is the only target where HWCODEC_HAVE_PIXELBUFFER is defined, i.e. the only
+    # place the guarded half of the pixel-buffer code is compiled at all.
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/target/ci-vcpkg
+    steps:
+      - name: Resolve ref
+        id: target
+        run: |
+          r="${{ github.event.inputs.ref }}"
+          [ -n "$r" ] || r="${{ github.ref_name }}"
+          echo "ref=$r" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.ref }}
+          submodules: recursive
+          persist-credentials: false
+
+      # The real macOS build compiles against rustdesk's vcpkg ffmpeg port, pinned to
+      # 7.1.1 (res/vcpkg/ffmpeg/vcpkg.json). `brew install ffmpeg` now resolves to 8.x,
+      # where the FF_PROFILE_* aliases util.cpp assigns were removed, so the C++ failed to
+      # compile against an ffmpeg no target actually ships. Pin the formula that matches
+      # the port and assert the symbol is present, so a silent upgrade cannot quietly turn
+      # this job into "compiles against a header set nobody uses".
+      - name: Install FFmpeg 7.1.1 headers
+        run: |
+          brew install pkgconf ffmpeg@7
+          prefix=$(brew --prefix ffmpeg@7)
+          echo "FFMPEG_PREFIX=$prefix" >> "$GITHUB_ENV"
+          "$prefix/bin/ffmpeg" -version | head -1
+          grep -q 'define FF_PROFILE_H264_HIGH' "$prefix/include/libavcodec/avcodec.h" \
+            && echo "FF_PROFILE_* present in the headers" \
+            || { echo "::error::ffmpeg@7 headers do not define FF_PROFILE_H264_HIGH"; exit 1; }
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # build.rs wants $VCPKG_ROOT/installed/<triplet>/include; the triplet on macOS is
+      # x64-osx / arm64-osx. `cargo check` does not link, so headers are enough.
+      - name: Fake the vcpkg install layout for headers only
+        run: |
+          if [ "$(uname -m)" = "arm64" ]; then triplet=arm64-osx; else triplet=x64-osx; fi
+          prefix=$FFMPEG_PREFIX
+          mkdir -p "$VCPKG_ROOT/installed/$triplet/include" "$VCPKG_ROOT/installed/$triplet/lib"
+          for h in libavcodec libavutil libavformat libswscale libavfilter libavdevice libswresample; do
+            [ -d "$prefix/include/$h" ] && ln -sfn "$prefix/include/$h" "$VCPKG_ROOT/installed/$triplet/include/$h"
+          done
+          ls -1 "$VCPKG_ROOT/installed/$triplet/include"
+
+      - name: cargo check (compiles the C++ through build.rs)
+        run: cargo check --lib
