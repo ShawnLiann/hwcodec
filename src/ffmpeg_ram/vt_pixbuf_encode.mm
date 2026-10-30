@@ -20,9 +20,65 @@ typedef void (*vt_out_cb)(const uint8_t* data, int size, int64_t pts, int key, v
 struct VTPixbufEncoder {
   VTCompressionSessionRef session;
   int width, height;
+  int hevc;
+  int force_keyframe;
   vt_out_cb cb;
   void* obj;
 };
+
+// VideoToolbox keeps SPS/PPS in the format description, not in the block buffer; a decoder that
+// only gets the block buffer cannot start, so prepend the parameter sets to every keyframe the
+// same way libavcodec does.
+static int vt_param_sets(CMFormatDescriptionRef fmt, int hevc, uint8_t* dst) {
+  size_t off = 0;
+  if (!fmt) return 0;
+  const uint8_t* first = NULL;
+  size_t first_len = 0, count_sz = 0;
+  int nal_len = 0;
+  OSStatus st = hevc
+      ? CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt, 0, &first, &first_len, &count_sz,
+                                                           &nal_len)
+      : CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, 0, &first, &first_len, &count_sz,
+                                                           &nal_len);
+  if (st != noErr) return 0;
+  int count = (int)count_sz;
+  for (int i = 0; i < count; i++) {
+    const uint8_t* ps = NULL;
+    size_t ps_len = 0;
+    st = hevc ? CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt, i, &ps, &ps_len, &count_sz,
+                                                                   &nal_len)
+              : CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, i, &ps, &ps_len, &count_sz,
+                                                                   &nal_len);
+    if (st != noErr || !ps || !ps_len) continue;
+    if (dst) {
+      dst[off] = 0;
+      dst[off + 1] = 0;
+      dst[off + 2] = 0;
+      dst[off + 3] = 1;
+      memcpy(dst + off + 4, ps, ps_len);
+    }
+    off += 4 + ps_len;
+  }
+  return (int)off;
+}
+
+// The block buffer carries AVCC (4-byte length prefixes) while the parameter sets above are
+// Annex-B; a decoder fed that mix stops immediately. Rewrite the prefixes in place (both are 4
+// bytes) so the whole packet is one Annex-B stream.
+static void vt_avcc_to_annexb(uint8_t* p, size_t len) {
+  if (len >= 4 && p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 1) return;
+  size_t off = 0;
+  while (off + 4 <= len) {
+    uint32_t n = ((uint32_t)p[off] << 24) | ((uint32_t)p[off + 1] << 16) |
+                 ((uint32_t)p[off + 2] << 8) | (uint32_t)p[off + 3];
+    if (n == 0 || off + 4 + n > len) break;
+    p[off] = 0;
+    p[off + 1] = 0;
+    p[off + 2] = 0;
+    p[off + 3] = 1;
+    off += 4 + n;
+  }
+}
 
 static void vt_output(VTPixbufEncoder* e, OSStatus st, CMSampleBufferRef sb) {
   if (st != noErr || !sb || !e->cb) return;
@@ -30,12 +86,6 @@ static void vt_output(VTPixbufEncoder* e, OSStatus st, CMSampleBufferRef sb) {
   if (!bb) return;
   size_t len = CMBlockBufferGetDataLength(bb);
   if (!len) return;
-  uint8_t* buf = (uint8_t*)malloc(len);
-  if (!buf) return;
-  if (CMBlockBufferCopyDataBytes(bb, 0, len, buf) != kCMBlockBufferNoErr) {
-    free(buf);
-    return;
-  }
   int64_t pts = (int64_t)CMSampleBufferGetPresentationTimeStamp(sb).value;
   CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sb, false);
   int key = 1;
@@ -43,7 +93,17 @@ static void vt_output(VTPixbufEncoder* e, OSStatus st, CMSampleBufferRef sb) {
     CFDictionaryRef d = (CFDictionaryRef)CFArrayGetValueAtIndex(atts, 0);
     key = CFDictionaryContainsKey(d, kCMSampleAttachmentKey_NotSync) ? 0 : 1;
   }
-  e->cb(buf, (int)len, pts, key, e->obj);
+  CMFormatDescriptionRef fmt = key ? CMSampleBufferGetFormatDescription(sb) : NULL;
+  size_t ps_len = fmt ? (size_t)vt_param_sets(fmt, e->hevc, NULL) : 0;
+  uint8_t* buf = (uint8_t*)malloc(ps_len + len);
+  if (!buf) return;
+  if (ps_len) vt_param_sets(fmt, e->hevc, buf);
+  if (CMBlockBufferCopyDataBytes(bb, 0, len, buf + ps_len) != kCMBlockBufferNoErr) {
+    free(buf);
+    return;
+  }
+  vt_avcc_to_annexb(buf + ps_len, len);
+  e->cb(buf, (int)(ps_len + len), pts, key, e->obj);
   free(buf);
 }
 
@@ -53,6 +113,8 @@ VTPixbufEncoder* vt_pixbuf_new(int width, int height, int codec /*0=h264, 1=hevc
   if (!e) return NULL;
   e->width = width;
   e->height = height;
+  e->hevc = codec ? 1 : 0;
+  e->force_keyframe = 1;
   e->cb = cb;
   e->obj = obj;
 
@@ -101,14 +163,28 @@ int vt_pixbuf_encode(VTPixbufEncoder* e, void* cvpixbuf, int64_t pts) {
                           kCVImageBufferTransferFunction_ITU_R_709_2,
                           kCVAttachmentMode_ShouldPropagate);
   }
+  CFDictionaryRef props = NULL;
+  if (e->force_keyframe) {
+    // Without this VT buffers the first frames instead of emitting an IDR, which the caller sees
+    // as "no output" and RustDesk counts as an encode failure.
+    const void* keys[] = {kVTEncodeFrameOptionKey_ForceKeyFrame};
+    const void* vals[] = {kCFBooleanTrue};
+    props = CFDictionaryCreate(NULL, keys, vals, 1, &kCFTypeDictionaryKeyCallBacks,
+                               &kCFTypeDictionaryValueCallBacks);
+  }
   OSStatus rc = VTCompressionSessionEncodeFrameWithOutputHandler(
-      e->session, pb, CMTimeMake(pts, 1000), kCMTimeInvalid, NULL, NULL,
+      e->session, pb, CMTimeMake(pts, 1000), kCMTimeInvalid, props, NULL,
       ^(OSStatus st, VTEncodeInfoFlags flags, CMSampleBufferRef sb) { vt_output(e, st, sb); });
+  if (props) CFRelease(props);
+  if (rc == noErr) e->force_keyframe = 0;
   return (int)rc;
 }
 
 void vt_pixbuf_flush(VTPixbufEncoder* e) {
-  if (e && e->session) VTCompressionSessionCompleteFrames(e->session, kCMTimeInvalid);
+  if (e && e->session) {
+    VTCompressionSessionCompleteFrames(e->session, kCMTimeInvalid);
+    e->force_keyframe = 1;
+  }
 }
 
 void vt_pixbuf_free(VTPixbufEncoder* e) {
