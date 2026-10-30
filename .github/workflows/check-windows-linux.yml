@@ -218,4 +218,7 @@ jobs:
       # weight. Restricted to this module: the rest of the repo's tests carry pre-existing
       # failures that would mask the signal.
       - name: unit tests of the pixel-buffer path
-        run: "cargo test --lib ffmpeg_ram:: -- --nocapture"
+        # `deref_nullptr` fires inside bindgen's generated `mux_ffi.rs` (the opaque pthread
+        # types), which is a pre-existing condition of this repo and not this module's code.
+        run: 'RUSTFLAGS="-A deref_nullptr" cargo test --lib ffmpeg_ram:: -- --nocapture'
+
