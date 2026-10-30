@@ -291,7 +291,17 @@ impl Decoder {
             }
             output.frames.push(frame);
         } else {
-            error!("unsupported pixfmt {}", pixfmt as i32);
+            // Once, not per frame: a 10-bit stream decodes 30 frames a second, and the
+            // reader of this log needs one line that names the limitation, not a flood.
+            // The software path has no conversion for anything but YUV420P and NV12, so
+            // such a stream produces no picture at all -- worth saying plainly.
+            static UNSUPPORTED: std::sync::Once = std::sync::Once::new();
+            UNSUPPORTED.call_once(|| {
+                error!(
+                    "unsupported pixfmt {}: no software conversion exists for it, so this stream cannot be presented (the software path handles YUV420P and NV12; 10-bit streams carry P010)",
+                    pixfmt as i32
+                );
+            });
         }
     }
 
