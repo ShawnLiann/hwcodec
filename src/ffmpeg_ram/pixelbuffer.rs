@@ -31,6 +31,24 @@ pub const PIXELBUFFER_REJECTED: c_int = 0;
 extern "C" {
     fn CVPixelBufferRetain(pixel_buffer: *mut c_void) -> *mut c_void;
     fn CVPixelBufferRelease(pixel_buffer: *mut c_void);
+    fn CVPixelBufferGetIOSurface(pixel_buffer: *mut c_void) -> *mut c_void;
+}
+
+/// Whether the buffer is IOSurface-backed, i.e. whether the renderer can build a
+/// Metal texture from it at all.
+///
+/// This is the same property the renderer checks before accepting a surface, so
+/// asking here keeps the decoder from handing out a frame the renderer is certain
+/// to refuse -- a frame it has already skipped the software transfer for. NV12
+/// alone does not imply an IOSurface.
+///
+/// # Safety
+/// `buffer` must be a valid `CVPixelBufferRef` for the duration of the call.
+pub unsafe fn has_iosurface(buffer: *mut c_void) -> bool {
+    if buffer.is_null() {
+        return false;
+    }
+    !CVPixelBufferGetIOSurface(buffer).is_null()
 }
 
 /// Whether a `CVPixelBuffer` pixel format can be sampled directly by the
@@ -132,11 +150,77 @@ pub(crate) mod test_support {
         pub fn CFGetRetainCount(cf: *const c_void) -> isize;
     }
 
-    /// Create a real CVPixelBuffer of the requested format (null attributes).
+    /// Create a real, IOSurface-backed CVPixelBuffer of the requested format.
+    ///
+    /// IOSurface backing is what a VideoToolbox-decoded frame carries and what the
+    /// renderer needs, so it is the realistic default for a test fixture.
     pub fn create_buffer(pixfmt: u32) -> Option<*mut c_void> {
+        create(pixfmt, true)
+    }
+
+    /// Create a buffer without IOSurface backing: a surface the renderer would
+    /// have to refuse, used to pin the decoder-side check.
+    pub fn create_buffer_without_iosurface(pixfmt: u32) -> Option<*mut c_void> {
+        create(pixfmt, false)
+    }
+
+    fn create(pixfmt: u32, iosurface: bool) -> Option<*mut c_void> {
+        extern "C" {
+            fn CFDictionaryCreate(
+                allocator: *const c_void,
+                keys: *const *const c_void,
+                values: *const *const c_void,
+                num_values: isize,
+                key_callbacks: *const c_void,
+                value_callbacks: *const c_void,
+            ) -> *const c_void;
+            fn CFRelease(cf: *const c_void);
+            static kCFTypeDictionaryKeyCallBacks: c_void;
+            static kCFTypeDictionaryValueCallBacks: c_void;
+            static kCVPixelBufferIOSurfacePropertiesKey: *const c_void;
+        }
         let mut raw: *mut c_void = std::ptr::null_mut();
-        let status =
-            unsafe { CVPixelBufferCreate(std::ptr::null(), 16, 16, pixfmt, std::ptr::null(), &mut raw) };
+        let status = if iosurface {
+            // { kCVPixelBufferIOSurfacePropertiesKey: {} } is what makes CoreVideo
+            // back the buffer with an IOSurface.
+            unsafe {
+                let empty: *const c_void = CFDictionaryCreate(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    &kCFTypeDictionaryKeyCallBacks,
+                    &kCFTypeDictionaryValueCallBacks,
+                );
+                let attrs = CFDictionaryCreate(
+                    std::ptr::null(),
+                    &kCVPixelBufferIOSurfacePropertiesKey as *const *const c_void,
+                    &empty as *const *const c_void,
+                    1,
+                    &kCFTypeDictionaryKeyCallBacks,
+                    &kCFTypeDictionaryValueCallBacks,
+                );
+                let status = CVPixelBufferCreate(
+                    std::ptr::null(),
+                    16,
+                    16,
+                    pixfmt,
+                    attrs as *const c_void,
+                    &mut raw,
+                );
+                if !attrs.is_null() {
+                    CFRelease(attrs);
+                }
+                if !empty.is_null() {
+                    CFRelease(empty);
+                }
+                status
+            }
+        } else {
+            unsafe {
+                CVPixelBufferCreate(std::ptr::null(), 16, 16, pixfmt, std::ptr::null(), &mut raw)
+            }
+        };
         if status == 0 && !raw.is_null() {
             Some(raw)
         } else {
@@ -162,6 +246,30 @@ mod tests {
             height: 16,
             pixfmt,
         }
+    }
+
+    #[test]
+    fn iosurface_backing_is_detected() {
+        let Some(backed) = create_buffer(PIXEL_FORMAT_420F) else {
+            eprintln!("skip: CVPixelBufferCreate failed in this environment");
+            return;
+        };
+        assert!(
+            unsafe { has_iosurface(backed) },
+            "a buffer created with IOSurface properties must report backing"
+        );
+        release_buffer(backed);
+
+        let Some(bare) = create_buffer_without_iosurface(PIXEL_FORMAT_420F) else {
+            eprintln!("skip: CVPixelBufferCreate failed in this environment");
+            return;
+        };
+        assert!(
+            !unsafe { has_iosurface(bare) },
+            "a buffer without IOSurface properties must not report backing"
+        );
+        release_buffer(bare);
+        assert!(!unsafe { has_iosurface(std::ptr::null_mut()) });
     }
 
     #[test]
@@ -195,16 +303,32 @@ mod tests {
 
         let base = unsafe { CFGetRetainCount(raw) };
         let owned = unsafe { PixelBufferFrame::retain_from_borrowed(&desc) }.expect("owned frame");
-        assert_eq!(unsafe { CFGetRetainCount(raw) }, base + 1, "retain_from_borrowed must add one reference");
+        assert_eq!(
+            unsafe { CFGetRetainCount(raw) },
+            base + 1,
+            "retain_from_borrowed must add one reference"
+        );
         assert_eq!((owned.width(), owned.height()), (16, 16));
         assert_eq!(owned.pixfmt(), PIXEL_FORMAT_420F);
 
         let cloned = owned.clone();
-        assert_eq!(unsafe { CFGetRetainCount(raw) }, base + 2, "clone must retain");
+        assert_eq!(
+            unsafe { CFGetRetainCount(raw) },
+            base + 2,
+            "clone must retain"
+        );
         drop(cloned);
-        assert_eq!(unsafe { CFGetRetainCount(raw) }, base + 1, "dropping a clone releases one reference");
+        assert_eq!(
+            unsafe { CFGetRetainCount(raw) },
+            base + 1,
+            "dropping a clone releases one reference"
+        );
         drop(owned);
-        assert_eq!(unsafe { CFGetRetainCount(raw) }, base, "drop must release the owned reference");
+        assert_eq!(
+            unsafe { CFGetRetainCount(raw) },
+            base,
+            "drop must release the owned reference"
+        );
 
         // release the reference created by CVPixelBufferCreate itself
         release_buffer(raw);

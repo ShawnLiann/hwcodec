@@ -7,7 +7,8 @@ use crate::ffmpeg::{init_av_log, AVHWDeviceType::*};
 use crate::ffmpeg_ram::{
     ffmpeg_ram_set_pixelbuffer_callback,
     pixelbuffer::{
-        is_direct_deliverable, PixelBufferFrame, PIXELBUFFER_ACCEPTED, PIXELBUFFER_REJECTED,
+        has_iosurface, is_direct_deliverable, PixelBufferFrame, PIXELBUFFER_ACCEPTED,
+        PIXELBUFFER_REJECTED,
     },
     FfiPixelBufferFrame,
 };
@@ -24,10 +25,6 @@ use std::{
     ffi::{c_void, CString},
     os::raw::c_int,
     slice::from_raw_parts,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
     time::Instant,
     vec,
 };
@@ -72,17 +69,22 @@ impl std::fmt::Display for DecodeFrame {
 /// a software frame clears the pending GPU frame of the same call, which makes
 /// "last decoded frame wins" hold across mixed frames.
 pub struct DecodeOutput {
-    frames: Vec<DecodeFrame>,
+    /// The software frames this call produced.
+    pub frames: Vec<DecodeFrame>,
+    /// The surface this call produced, if the caller asked for one and the
+    /// decoder could hand it over. Presenting it means the caller must not also
+    /// present `frames`: the decoder skipped the software transfer for it.
     #[cfg(target_os = "macos")]
-    pixelbuffer: Option<PixelBufferFrame>,
-    /// The caller's "can you present GPU frames" flag, shared by reference so
-    /// the answer can change between frames without touching the decoder.
+    pub pixelbuffer: Option<PixelBufferFrame>,
+    /// The caller's decision for *this* decode call, taken as an argument rather
+    /// than held as shared state: the library has no business owning a piece of
+    /// the application's rendering policy, and a per-call value cannot be read
+    /// halfway through a batch.
     ///
-    /// `None` means the caller never asked for GPU frames, and the callback then
-    /// rejects every frame: delivery is opt-in, because accepting one makes the
-    /// decoder skip the software transfer for that frame.
+    /// `false` means the decoder keeps its software transfer, which is the
+    /// behaviour every caller had before this path existed.
     #[cfg(target_os = "macos")]
-    pixelbuffer_wanted: Option<Arc<AtomicBool>>,
+    pub want_gpu: bool,
 }
 
 impl DecodeOutput {
@@ -92,8 +94,16 @@ impl DecodeOutput {
             #[cfg(target_os = "macos")]
             pixelbuffer: None,
             #[cfg(target_os = "macos")]
-            pixelbuffer_wanted: None,
+            want_gpu: false,
         }
+    }
+
+    /// Take the surface of this call, if there is one.
+    ///
+    /// Taking it is what stops the same frame from being presented twice.
+    #[cfg(target_os = "macos")]
+    pub fn take_pixelbuffer(&mut self) -> Option<PixelBufferFrame> {
+        self.pixelbuffer.take()
     }
 
     fn clear(&mut self) {
@@ -141,17 +151,24 @@ impl Decoder {
         }
     }
 
-    pub fn decode(&mut self, packet: &[u8]) -> Result<&mut Vec<DecodeFrame>, i32> {
-        // No `&mut DecodeOutput` may be alive while `ffmpeg_ram_decode` runs: the C
-        // side calls `callback` synchronously, and that callback reaches this same
-        // allocation through the raw pointer and takes its own reference to it.
-        // Two live `&mut`s to one object violate the aliasing rules even when one
-        // thread touches both, so the clear and the read each borrow through the
-        // raw pointer for the length of a statement, and the FFI call runs with no
-        // borrow alive at all.
+    /// Decode one packet and hand back the whole transaction.
+    ///
+    /// `want_gpu` is the caller's decision for this packet: a surface can only be
+    /// taken over while the decode call runs, so the decision has to be an
+    /// argument rather than something read afterwards -- a frame accepted there
+    /// and dropped further up would leave the renderer with neither a GPU frame
+    /// nor a software one. On platforms without the surface path the argument is
+    /// ignored, so callers can pass their decision unconditionally.
+    pub fn decode_gpu(&mut self, packet: &[u8], want_gpu: bool) -> Result<&mut DecodeOutput, i32> {
         let output = self.output;
         unsafe {
             (*output).clear();
+            #[cfg(target_os = "macos")]
+            {
+                (*output).want_gpu = want_gpu;
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = want_gpu;
             let ret = ffmpeg_ram_decode(
                 self.codec,
                 packet.as_ptr(),
@@ -162,9 +179,16 @@ impl Decoder {
             if ret < 0 {
                 Err(ret)
             } else {
-                Ok(&mut (*output).frames)
+                Ok(&mut *output)
             }
         }
+    }
+
+    pub fn decode(&mut self, packet: &[u8]) -> Result<&mut Vec<DecodeFrame>, i32> {
+        // Kept for every caller that only wants the software frames, which is all
+        // of them outside the macOS surface path.
+        let output = self.decode_gpu(packet, false)?;
+        Ok(&mut output.frames)
     }
 
     unsafe extern "C" fn callback(
@@ -271,48 +295,6 @@ impl Decoder {
         }
     }
 
-    /// The software frames produced by the last `decode()` call.
-    ///
-    /// Use this instead of the `decode()` return value when the caller must
-    /// also read [`Self::take_pixelbuffer`]: `decode()` returns a mutable borrow
-    /// of the decoder, so the two cannot overlap.
-    pub fn last_frames(&self) -> &[DecodeFrame] {
-        unsafe { &(*self.output).frames }
-    }
-
-    /// Take the GPU frame delivered to this decode call, if any.
-    ///
-    /// `None` means this call produced no direct frame: either the decoder
-    /// rejected it, the format is not directly deliverable, or a software frame
-    /// won in the same transaction. The caller must not fall back to a frame
-    /// from a previous call.
-    #[cfg(target_os = "macos")]
-    pub fn take_pixelbuffer(&mut self) -> Option<PixelBufferFrame> {
-        unsafe { (&mut *self.output).pixelbuffer.take() }
-    }
-
-    #[cfg(target_os = "macos")]
-    pub fn has_pixelbuffer(&self) -> bool {
-        unsafe { (&*self.output).pixelbuffer.is_some() }
-    }
-
-    /// Share the caller's "can you present GPU frames" flag with this decoder.
-    ///
-    /// The C++ decoder only skips its software transfer when the pixel buffer
-    /// callback accepts a frame *during* the decode call, so the decision has to
-    /// be taken there rather than after the fact: a frame accepted here and
-    /// dropped further up leaves the renderer with neither a GPU frame nor a
-    /// software one.  Rejecting here makes the decoder fall back to the software
-    /// transfer on that very frame.
-    ///
-    /// Taking the flag by reference (instead of a plain bool) means the caller
-    /// can flip it at any time, e.g. when the user switches the render path, and
-    /// the change applies from the next decoded frame.
-    #[cfg(target_os = "macos")]
-    pub fn set_pixelbuffer_wanted(&mut self, wanted: Arc<AtomicBool>) {
-        unsafe { (&mut *self.output).pixelbuffer_wanted = Some(wanted) };
-    }
-
     /// Borrowed-descriptor callback from the decoder.
     ///
     /// Accepting means "retained and stored"; rejecting means "nothing kept",
@@ -334,14 +316,18 @@ impl Decoder {
         //
         // Delivery is opt-in: a decoder the caller never configured keeps
         // producing software frames, exactly like before this API existed.
-        let Some(wanted) = &output.pixelbuffer_wanted else {
-            return PIXELBUFFER_REJECTED;
-        };
-        if !wanted.load(Ordering::Relaxed) {
+        if !output.want_gpu {
             return PIXELBUFFER_REJECTED;
         }
         let frame = &*frame;
-        if !is_direct_deliverable(frame.pixfmt) || frame.pixel_buffer.is_null() {
+        if frame.pixel_buffer.is_null() || !is_direct_deliverable(frame.pixfmt) {
+            return PIXELBUFFER_REJECTED;
+        }
+        // Deterministic incompatibility, checked before the decoder skips its
+        // software transfer: the renderer builds a Metal texture from the buffer's
+        // IOSurface, so a frame without one would be accepted here and refused
+        // there -- with no software pixels left to fall back to.
+        if !has_iosurface(frame.pixel_buffer) {
             return PIXELBUFFER_REJECTED;
         }
         match PixelBufferFrame::retain_from_borrowed(frame) {
@@ -547,7 +533,9 @@ impl Drop for Decoder {
 #[cfg(all(test, target_os = "macos"))]
 mod output_tests {
     use super::*;
-    use crate::ffmpeg_ram::pixelbuffer::test_support::{create_buffer, release_buffer};
+    use crate::ffmpeg_ram::pixelbuffer::test_support::{
+        create_buffer, create_buffer_without_iosurface, release_buffer,
+    };
 
     const W: i32 = 16;
     const H: i32 = 16;
@@ -556,7 +544,7 @@ mod output_tests {
     /// `DecodeOutput::new()` would reject everything.
     fn output_wanting_gpu(wanted: bool) -> DecodeOutput {
         let mut output = DecodeOutput::new();
-        output.pixelbuffer_wanted = Some(std::sync::Arc::new(AtomicBool::new(wanted)));
+        output.want_gpu = wanted;
         output
     }
 
@@ -606,8 +594,8 @@ mod output_tests {
         };
         let mut output = DecodeOutput::new();
         assert!(
-            output.pixelbuffer_wanted.is_none(),
-            "a decoder without a caller flag must not want GPU frames"
+            !output.want_gpu,
+            "a decoder the caller never asked must not want GPU frames"
         );
         assert_eq!(
             direct_frame(
@@ -623,7 +611,7 @@ mod output_tests {
         );
 
         // ... and it accepts once the caller says it can present them.
-        output.pixelbuffer_wanted = Some(std::sync::Arc::new(AtomicBool::new(true)));
+        output.want_gpu = true;
         assert_eq!(
             direct_frame(
                 &mut output,
@@ -704,6 +692,34 @@ mod output_tests {
         let mut output = output_wanting_gpu(true);
         assert_eq!(
             direct_frame(&mut output, 0x4247_5241, raw),
+            PIXELBUFFER_REJECTED
+        );
+        assert!(
+            output.pixelbuffer.is_none(),
+            "a rejected frame must retain nothing"
+        );
+        release_buffer(raw);
+    }
+
+    #[test]
+    fn a_surface_without_iosurface_backing_is_rejected() {
+        // The renderer builds a Metal texture from the buffer's IOSurface, so a
+        // buffer without one is a surface it is certain to refuse. Refusing here
+        // is what keeps the decoder from skipping the software transfer for a
+        // frame that then has nowhere to land.
+        let Some(raw) =
+            create_buffer_without_iosurface(crate::ffmpeg_ram::pixelbuffer::PIXEL_FORMAT_420F)
+        else {
+            eprintln!("skip: CVPixelBufferCreate failed in this environment");
+            return;
+        };
+        let mut output = output_wanting_gpu(true);
+        assert_eq!(
+            direct_frame(
+                &mut output,
+                crate::ffmpeg_ram::pixelbuffer::PIXEL_FORMAT_420F,
+                raw
+            ),
             PIXELBUFFER_REJECTED
         );
         assert!(
