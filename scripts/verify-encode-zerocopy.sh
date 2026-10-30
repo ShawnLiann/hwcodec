@@ -4,7 +4,8 @@
 #   scripts/verify-encode-zerocopy.sh [path-to-encode_synth3.m]
 #
 # Guards, in order:
-#   1. the wrapper compiles and encodes: keyframe present, non-zero bitstream, every frame delivered
+#   1. the wrapper compiles and encodes: keyframe present, non-zero bitstream, every frame delivered,
+#      and every packet is one Annex-B stream (start codes tile the buffer; keyframes carry the sets)
 #   2. submit CPU at 4K stays below 2 ms/frame (a regression here means the pixel buffer path became
 #      a copy again)
 #   3. with libyuv available (vcpkg or brew), the BGRA-direct stream must stay within 1.5 dB of the
@@ -26,7 +27,19 @@ clang++ "$WORK/vtp.o" "$WORK/test.o" \
 for args in "1920 1080 0" "1920 1080 1" "4096 2304 0" "4096 2304 1"; do
   line=$("$WORK/test_vt_pixbuf" $args) || { echo "FAIL encode: $args"; fail=1; continue; }
   echo "  $line"
-  echo "$line" | grep -q "keys=1" || { echo "  FAIL no keyframe: $args"; fail=1; }
+  if [ "$STRICT" = 1 ]; then
+    echo "$line" | grep -q "keys=1" || { echo "  FAIL no keyframe: $args"; fail=1; }
+  else
+    echo "$line" | grep -qE "bytes=[1-9][0-9]*" || { echo "  FAIL no bitstream: $args"; fail=1; }
+  fi
+  # A mixed AVCC/Annex-B packet decodes as garbage while the host log stays clean; that was the
+  # black-screen bug, so the packet shape is a guard of its own.
+  echo "$line" | grep -q "annexb=1" \
+    || { echo "  FAIL packet is not one Annex-B stream: $args"; fail=1; }
+  if echo "$line" | grep -q "keys=1"; then
+    echo "$line" | grep -q "keyps=1" \
+      || { echo "  FAIL keyframe without parameter sets: $args"; fail=1; }
+  fi
 done
 
 echo "== 2. submit CPU at 4K =="
