@@ -236,7 +236,9 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{create_buffer, release_buffer, CFGetRetainCount};
+    use super::test_support::{
+        create_buffer, create_buffer_without_iosurface, release_buffer, CFGetRetainCount,
+    };
     use super::*;
 
     fn descriptor(raw: *mut c_void, pixfmt: u32) -> FfiPixelBufferFrame {
