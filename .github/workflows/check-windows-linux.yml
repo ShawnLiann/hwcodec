@@ -180,8 +180,21 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
-      - name: Install FFmpeg headers
-        run: brew install pkgconf ffmpeg || brew upgrade ffmpeg
+      # The real macOS build compiles against rustdesk's vcpkg ffmpeg port, pinned to
+      # 7.1.1 (res/vcpkg/ffmpeg/vcpkg.json). `brew install ffmpeg` now resolves to 8.x,
+      # where the FF_PROFILE_* aliases util.cpp assigns were removed, so the C++ failed to
+      # compile against an ffmpeg no target actually ships. Pin the formula that matches
+      # the port and assert the symbol is present, so a silent upgrade cannot quietly turn
+      # this job into "compiles against a header set nobody uses".
+      - name: Install FFmpeg 7.1.1 headers
+        run: |
+          brew install pkgconf ffmpeg@7
+          prefix=$(brew --prefix ffmpeg@7)
+          echo "FFMPEG_PREFIX=$prefix" >> "$GITHUB_ENV"
+          "$prefix/bin/ffmpeg" -version | head -1
+          grep -q 'define FF_PROFILE_H264_HIGH' "$prefix/include/libavcodec/avcodec.h" \
+            && echo "FF_PROFILE_* present in the headers" \
+            || { echo "::error::ffmpeg@7 headers do not define FF_PROFILE_H264_HIGH"; exit 1; }
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -190,7 +203,7 @@ jobs:
       - name: Fake the vcpkg install layout for headers only
         run: |
           if [ "$(uname -m)" = "arm64" ]; then triplet=arm64-osx; else triplet=x64-osx; fi
-          prefix=$(brew --prefix)
+          prefix=$FFMPEG_PREFIX
           mkdir -p "$VCPKG_ROOT/installed/$triplet/include" "$VCPKG_ROOT/installed/$triplet/lib"
           for h in libavcodec libavutil libavformat libswscale libavfilter libavdevice libswresample; do
             [ -d "$prefix/include/$h" ] && ln -sfn "$prefix/include/$h" "$VCPKG_ROOT/installed/$triplet/include/$h"
