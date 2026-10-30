@@ -34,13 +34,8 @@ extern "C" {
     fn CVPixelBufferGetIOSurface(pixel_buffer: *mut c_void) -> *mut c_void;
 }
 
-/// Whether the buffer is IOSurface-backed, i.e. whether the renderer can build a
-/// Metal texture from it at all.
-///
-/// This is the same property the renderer checks before accepting a surface, so
-/// asking here keeps the decoder from handing out a frame the renderer is certain
-/// to refuse -- a frame it has already skipped the software transfer for. NV12
-/// alone does not imply an IOSurface.
+/// Whether the buffer is IOSurface-backed: the renderer builds its Metal texture from
+/// that, so a buffer without one is a surface it will refuse. NV12 does not imply it.
 ///
 /// # Safety
 /// `buffer` must be a valid `CVPixelBufferRef` for the duration of the call.
@@ -150,16 +145,12 @@ pub(crate) mod test_support {
         pub fn CFGetRetainCount(cf: *const c_void) -> isize;
     }
 
-    /// Create a real, IOSurface-backed CVPixelBuffer of the requested format.
-    ///
-    /// IOSurface backing is what a VideoToolbox-decoded frame carries and what the
-    /// renderer needs, so it is the realistic default for a test fixture.
+    /// Create a real, IOSurface-backed CVPixelBuffer, as VideoToolbox delivers one.
     pub fn create_buffer(pixfmt: u32) -> Option<*mut c_void> {
         create(pixfmt, true)
     }
 
-    /// Create a buffer without IOSurface backing: a surface the renderer would
-    /// have to refuse, used to pin the decoder-side check.
+    /// Create a buffer without IOSurface backing, which the decoder must refuse.
     pub fn create_buffer_without_iosurface(pixfmt: u32) -> Option<*mut c_void> {
         create(pixfmt, false)
     }
@@ -181,8 +172,7 @@ pub(crate) mod test_support {
         }
         let mut raw: *mut c_void = std::ptr::null_mut();
         let status = if iosurface {
-            // { kCVPixelBufferIOSurfacePropertiesKey: {} } is what makes CoreVideo
-            // back the buffer with an IOSurface.
+            // { kCVPixelBufferIOSurfacePropertiesKey: {} } is what adds IOSurface backing.
             unsafe {
                 let empty: *const c_void = CFDictionaryCreate(
                     std::ptr::null(),

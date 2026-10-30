@@ -71,18 +71,12 @@ impl std::fmt::Display for DecodeFrame {
 pub struct DecodeOutput {
     /// The software frames this call produced.
     pub frames: Vec<DecodeFrame>,
-    /// The surface this call produced, if the caller asked for one and the
-    /// decoder could hand it over. Presenting it means the caller must not also
-    /// present `frames`: the decoder skipped the software transfer for it.
+    /// The surface this call produced, if the caller asked for one and the decoder
+    /// could hand it over. If present, `frames` is empty: the software transfer was skipped.
     #[cfg(target_os = "macos")]
     pub pixelbuffer: Option<PixelBufferFrame>,
-    /// The caller's decision for *this* decode call, taken as an argument rather
-    /// than held as shared state: the library has no business owning a piece of
-    /// the application's rendering policy, and a per-call value cannot be read
-    /// halfway through a batch.
-    ///
-    /// `false` means the decoder keeps its software transfer, which is the
-    /// behaviour every caller had before this path existed.
+    /// Whether the caller can present a surface for this call. `false` keeps the software
+    /// transfer, which is what every caller had before this path existed.
     #[cfg(target_os = "macos")]
     pub want_gpu: bool,
 }
@@ -98,9 +92,8 @@ impl DecodeOutput {
         }
     }
 
-    /// Take the surface of this call, if there is one.
-    ///
-    /// Taking it is what stops the same frame from being presented twice.
+    /// Take the surface of this call, if any. Taking it is what keeps the same frame
+    /// from being presented twice.
     #[cfg(target_os = "macos")]
     pub fn take_pixelbuffer(&mut self) -> Option<PixelBufferFrame> {
         self.pixelbuffer.take()
@@ -153,12 +146,9 @@ impl Decoder {
 
     /// Decode one packet and hand back the whole transaction.
     ///
-    /// `want_gpu` is the caller's decision for this packet: a surface can only be
-    /// taken over while the decode call runs, so the decision has to be an
-    /// argument rather than something read afterwards -- a frame accepted there
-    /// and dropped further up would leave the renderer with neither a GPU frame
-    /// nor a software one. On platforms without the surface path the argument is
-    /// ignored, so callers can pass their decision unconditionally.
+    /// `want_gpu` must be decided before the call: a surface can only be taken while the
+    /// decode runs, and a frame accepted here but dropped further up leaves the renderer
+    /// with neither. Platforms without the surface path ignore it.
     pub fn decode_gpu(&mut self, packet: &[u8], want_gpu: bool) -> Result<&mut DecodeOutput, i32> {
         let output = self.output;
         unsafe {
@@ -185,8 +175,6 @@ impl Decoder {
     }
 
     pub fn decode(&mut self, packet: &[u8]) -> Result<&mut Vec<DecodeFrame>, i32> {
-        // Kept for every caller that only wants the software frames, which is all
-        // of them outside the macOS surface path.
         let output = self.decode_gpu(packet, false)?;
         Ok(&mut output.frames)
     }
@@ -200,12 +188,8 @@ impl Decoder {
         datas: *mut *mut u8,
         key: c_int,
     ) {
-        // A panic here aborts the process: the release profile is `panic = "abort"`,
-        // so `catch_unwind` would be inert and this callback has to be non-panicking
-        // by construction. That means validating every pointer and length the C side
-        // hands over before building a slice from it -- `from_raw_parts` on a null
-        // pointer, or on a negative linesize cast to usize, is undefined behaviour
-        // rather than a panic, and no unwinding story would catch it either.
+        // `panic = "abort"` in release, so `catch_unwind` would be inert: every pointer the
+        // C side hands over must be validated before building a slice from it.
         if obj.is_null() || datas.is_null() || linesizes.is_null() {
             error!("decode callback got a null object or plane array");
             return;
@@ -222,9 +206,8 @@ impl Decoder {
         let datas = from_raw_parts(datas, AV_NUM_DATA_POINTERS as _);
         let linesizes = from_raw_parts(linesizes, AV_NUM_DATA_POINTERS as _);
 
-        // Every plane this format reads is dereferenced below, so validate the
-        // pointer and the stride first: a null plane or a non-positive stride is a
-        // producer bug, and dropping the frame beats reading unmapped memory.
+        // A null plane or non-positive stride is a producer bug; dropping the frame beats
+        // reading unmapped memory.
         let planes = if pixfmt == AVPixelFormat::AV_PIX_FMT_YUV420P as c_int {
             3
         } else if pixfmt == AVPixelFormat::AV_PIX_FMT_NV12 as c_int {
@@ -291,10 +274,7 @@ impl Decoder {
             }
             output.frames.push(frame);
         } else {
-            // Once, not per frame: a 10-bit stream decodes 30 frames a second, and the
-            // reader of this log needs one line that names the limitation, not a flood.
-            // The software path has no conversion for anything but YUV420P and NV12, so
-            // such a stream produces no picture at all -- worth saying plainly.
+            // Once per process: a 10-bit stream would otherwise log this at frame rate.
             static UNSUPPORTED: std::sync::Once = std::sync::Once::new();
             UNSUPPORTED.call_once(|| {
                 error!(
@@ -333,10 +313,8 @@ impl Decoder {
         if frame.pixel_buffer.is_null() || !is_direct_deliverable(frame.pixfmt) {
             return PIXELBUFFER_REJECTED;
         }
-        // Deterministic incompatibility, checked before the decoder skips its
-        // software transfer: the renderer builds a Metal texture from the buffer's
-        // IOSurface, so a frame without one would be accepted here and refused
-        // there -- with no software pixels left to fall back to.
+        // The renderer builds its Metal texture from the IOSurface, so a buffer without one
+        // would be accepted here and refused there, with no software pixels left.
         if !has_iosurface(frame.pixel_buffer) {
             return PIXELBUFFER_REJECTED;
         }
@@ -713,10 +691,6 @@ mod output_tests {
 
     #[test]
     fn a_surface_without_iosurface_backing_is_rejected() {
-        // The renderer builds a Metal texture from the buffer's IOSurface, so a
-        // buffer without one is a surface it is certain to refuse. Refusing here
-        // is what keeps the decoder from skipping the software transfer for a
-        // frame that then has nowhere to land.
         let Some(raw) =
             create_buffer_without_iosurface(crate::ffmpeg_ram::pixelbuffer::PIXEL_FORMAT_420F)
         else {
