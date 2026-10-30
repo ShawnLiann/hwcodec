@@ -223,6 +223,12 @@ jobs:
           # pre-existing in this repo, unrelated to this module.
           # `cargo check` never links, so this is the first step here that needs libavcodec
           # itself; FFMPEG_PREFIX is the real brew install, so point the linker at it.
+          #
+          # bindgen also generates its own `bindgen_test_layout_*` tests, which build a
+          # `&(*(ptr::null())).field` reference: with the lint allowed they no longer fail to
+          # compile but panic at run time ("null reference produced"), and a non-unwinding
+          # panic aborts the whole binary before any result is printed. They assert nothing
+          # about this module, so they are skipped by name.
           export RUSTFLAGS="-A deref_nullptr -L $FFMPEG_PREFIX/lib"
-          cargo test --lib ffmpeg_ram:: -- --nocapture
+          cargo test --lib ffmpeg_ram:: -- --nocapture --skip bindgen_test_layout
 
