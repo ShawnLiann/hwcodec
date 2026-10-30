@@ -15,6 +15,8 @@ include!(concat!(env!("OUT_DIR"), "/ffmpeg_ram_ffi.rs"));
 pub mod decode;
 pub mod encode;
 #[cfg(target_os = "macos")]
+pub mod vt_pixbuf;
+#[cfg(target_os = "macos")]
 pub mod pixelbuffer;
 
 pub enum Priority {

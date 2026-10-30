@@ -240,6 +240,14 @@ mod ffmpeg {
         builder.files(
             ["ffmpeg_ram_encode.cpp", "ffmpeg_ram_decode.cpp"].map(|f| ffmpeg_ram_dir.join(f)),
         );
+
+        if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+            builder.file(manifest_dir.join("src").join("ffmpeg_ram").join("vt_pixbuf_encode.mm"));
+            println!("cargo:rustc-link-lib=framework=VideoToolbox");
+            println!("cargo:rustc-link-lib=framework=CoreVideo");
+            println!("cargo:rustc-link-lib=framework=CoreMedia");
+            println!("cargo:rustc-link-lib=framework=Foundation");
+        }
     }
 
     #[cfg(feature = "vram")]

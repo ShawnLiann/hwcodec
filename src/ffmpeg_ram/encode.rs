@@ -38,6 +38,7 @@ pub struct EncodeContext {
     pub thread_count: i32,
 }
 
+#[derive(Clone)]
 pub struct EncodeFrame {
     pub data: Vec<u8>,
     pub pts: i64,
@@ -57,6 +58,8 @@ pub struct Encoder {
     pub linesize: Vec<i32>,
     pub offset: Vec<i32>,
     pub length: i32,
+    #[cfg(target_os = "macos")]
+    vt: Option<crate::ffmpeg_ram::vt_pixbuf::VTEncoder>,
 }
 
 impl Encoder {
@@ -109,6 +112,8 @@ impl Encoder {
                 linesize,
                 offset,
                 length: length[0],
+                #[cfg(target_os = "macos")]
+                vt: None,
             })
         }
     }
@@ -125,6 +130,44 @@ impl Encoder {
             );
             if result != 0 {
                 return Err(result);
+            }
+            Ok(&mut *self.frames)
+        }
+    }
+
+    /// macOS: submit a CVPixelBuffer (IOSurface-backed is the point) and return encoded packets.
+    /// Own VTCompressionSession, so no ffmpeg and no CPU-side BGRA -> NV12 conversion.
+    #[cfg(target_os = "macos")]
+    pub fn encode_pixbuf(
+        &mut self,
+        cvpixelbuffer: *mut c_void,
+        ms: i64,
+    ) -> Result<&mut Vec<EncodeFrame>, i32> {
+        if self.vt.is_none() {
+            let format = Encoder::format_from_name(self.ctx.name.clone()).map_err(|_| -1)?;
+            self.vt = crate::ffmpeg_ram::vt_pixbuf::VTEncoder::new(
+                self.ctx.width,
+                self.ctx.height,
+                format,
+                self.ctx.fps,
+                self.ctx.kbs,
+                self.ctx.gop,
+            );
+            if self.vt.is_none() {
+                return Err(-2);
+            }
+        }
+        let vt = self.vt.as_ref().ok_or(-2)?;
+        let encoded = vt.encode(cvpixelbuffer, ms).map_err(|_| -3)?;
+        unsafe {
+            let frames = &mut *self.frames;
+            frames.clear();
+            for f in encoded {
+                frames.push(EncodeFrame {
+                    data: f.data,
+                    pts: f.pts,
+                    key: if f.key { 1 } else { 0 },
+                });
             }
             Ok(&mut *self.frames)
         }
@@ -266,15 +309,6 @@ impl Encoder {
         #[cfg(target_os = "macos")]
         {
             let (_h264, h265, _, _) = crate::common::get_video_toolbox_codec_support();
-            // h264 encode failed too often, not AV_CODEC_CAP_HARDWARE
-            // if h264 {
-            //     codecs.push(CodecInfo {
-            //         name: "h264_videotoolbox".to_owned(),
-            //         format: H264,
-            //         priority: Priority::Best as _,
-            //         ..Default::default()
-            //     });
-            // }
             if h265 {
                 codecs.push(CodecInfo {
                     name: "hevc_videotoolbox".to_owned(),
