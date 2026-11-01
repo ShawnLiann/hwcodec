@@ -3,6 +3,10 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define AV_NUM_DATA_POINTERS 8
 
 typedef void (*RamDecodeCallback)(const void *obj, int width, int height,
@@ -61,5 +65,9 @@ int ffmpeg_ram_set_bitrate(void *encoder, int kbs);
  * concurrent decode. */
 void ffmpeg_ram_set_pixelbuffer_callback(void *decoder,
                                          RamPixelBufferCallback callback);
+
+#ifdef __cplusplus
+} // extern "C"
+#endif
 
 #endif // FFMPEG_RAM_FFI_H

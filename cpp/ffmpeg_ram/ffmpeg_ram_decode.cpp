@@ -32,34 +32,11 @@ extern "C" {
 #include "common.h"
 #include "system.h"
 
+#include "ffmpeg_ram_ffi.h"
+
 // #define CFG_PKG_TRACE
 
 namespace {
-typedef void (*RamDecodeCallback)(const void *obj, int width, int height,
-                                  enum AVPixelFormat pixfmt,
-                                  int linesize[AV_NUM_DATA_POINTERS],
-                                  uint8_t *data[AV_NUM_DATA_POINTERS], int key);
-
-/* Kept in sync with cpp/ffmpeg_ram/ffmpeg_ram_ffi.h. Declared locally because
- * this translation unit has its own RamDecodeCallback typedef.
- *
- * The frame struct and the callback typedef are deliberately declared on every
- * platform, not only under HWCODEC_HAVE_PIXELBUFFER: the exported setter below
- * takes a RamPixelBufferCallback in its signature on all targets (its body is a
- * no-op where no pixel buffer exists), and MSVC rejects that signature with
- * C2061 when the type is only declared inside the Apple guard. Nothing here
- * depends on CoreVideo - the pixfmt constants used to compare against live in
- * is_direct_deliverable, which stays guarded. */
-#define PIXELBUFFER_REJECTED 0
-#define PIXELBUFFER_ACCEPTED 1
-struct FfiPixelBufferFrame {
-  void *pixel_buffer; /* borrowed CVPixelBufferRef, valid only during the call */
-  int32_t width;
-  int32_t height;
-  uint32_t pixfmt;
-};
-typedef int32_t (*RamPixelBufferCallback)(void *obj,
-                                          const FfiPixelBufferFrame *frame);
 
 #ifdef HWCODEC_HAVE_PIXELBUFFER
 static bool is_direct_deliverable(uint32_t pixfmt) {
@@ -357,8 +334,9 @@ private:
 
 } // namespace
 
-extern "C" void ffmpeg_ram_free_decoder(FFmpegRamDecoder *decoder) {
+extern "C" void ffmpeg_ram_free_decoder(void *handle) {
   try {
+    FFmpegRamDecoder *decoder = static_cast<FFmpegRamDecoder *>(handle);
     if (!decoder)
       return;
     decoder->free_decoder();
@@ -371,9 +349,9 @@ extern "C" void ffmpeg_ram_free_decoder(FFmpegRamDecoder *decoder) {
   }
 }
 
-extern "C" FFmpegRamDecoder *
-ffmpeg_ram_new_decoder(const char *name, int device_type, int thread_count,
-                       RamDecodeCallback callback) {
+extern "C" void *ffmpeg_ram_new_decoder(const char *name, int device_type,
+                                        int thread_count,
+                                        RamDecodeCallback callback) {
   FFmpegRamDecoder *decoder = NULL;
   try {
     decoder = new FFmpegRamDecoder(name, device_type, thread_count, callback);
@@ -395,9 +373,10 @@ ffmpeg_ram_new_decoder(const char *name, int device_type, int thread_count,
   return NULL;
 }
 
-extern "C" int ffmpeg_ram_decode(FFmpegRamDecoder *decoder, const uint8_t *data,
-                                 int length, const void *obj) {
+extern "C" int ffmpeg_ram_decode(void *handle, const uint8_t *data, int length,
+                                 const void *obj) {
   try {
+    FFmpegRamDecoder *decoder = static_cast<FFmpegRamDecoder *>(handle);
     int ret = decoder->decode(data, length, obj);
     if (DataFormat::H265 == decoder->data_format_ && util_decode::has_flag_could_not_find_ref_with_poc()) {
       return HWCODEC_ERR_HEVC_COULD_NOT_FIND_POC;
