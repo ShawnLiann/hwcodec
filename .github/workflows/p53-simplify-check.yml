@@ -119,8 +119,8 @@ jobs:
           restore-keys: |
             macos-pb-${{ matrix.target }}-${{ env.VCPKG_COMMIT }}-
 
-      - name: Install nasm (ffmpeg assembler on x86_64)
-        if: ${{ matrix.target == 'x86_64-apple-darwin' }}
+      # rustdesk's ffmpeg port asks for nasm on every triplet, arm64 included
+      - name: Install nasm (required by the ffmpeg port)
         run: |
           set -euo pipefail
           if ! command -v nasm >/dev/null 2>&1; then
