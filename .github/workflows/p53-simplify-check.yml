@@ -1,0 +1,203 @@
+name: p53 simplify check
+
+# Fork-only verification for wip/p53-simplify-20261101. This file is test
+# infrastructure, not part of the change: drop it before anything is offered
+# upstream. Same pattern as check-windows-linux.yml on the fork's default
+# branch.
+#
+# What it proves for the A+B+C simplification of hwcodec#53:
+#   macos-15        Apple Silicon, full `cargo build` + `cargo test --lib`
+#   macos-15-intel  Intel, same
+#   ubuntu-24.04    the non-macOS half compiles: `Decoded` without the
+#                   pixelbuffer field, `want_gpu` accepted and ignored
+# macOS is the only place HWCODEC_HAVE_PIXELBUFFER is defined, i.e. the only
+# place the pixel-buffer code is compiled at all, so the two macOS jobs carry
+# the real signal and Linux keeps the cross-platform one honest.
+
+on:
+  push:
+    branches: ['wip/p53-simplify-20261101']
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  VCPKG_COMMIT: 120deac3062162151622ca4860575a33844ba10b
+  VCPKG_ROOT: ${{ github.workspace }}/target/ci-vcpkg
+  VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/target/vcpkg-cache,readwrite
+  # bindgen 0.59 emits the classic offsetof pattern
+  #   &(*(::std::ptr::null::<_opaque_pthread_t>())).__cleanup_stack
+  # which newer rustc rejects through the deny-by-default `deref_nullptr` lint.
+  # Pre-existing, unrelated to this branch; allow the one lint and skip the
+  # generated bindgen_test_layout_* tests, which abort the process with a
+  # non-unwinding panic ("null reference produced") before anything reports.
+  RUSTFLAGS: "-A deref_nullptr"
+
+jobs:
+  macos:
+    name: ${{ matrix.target }} / test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            triplet: arm64-osx
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            triplet: x64-osx
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout hwcodec
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Assert target_os is macos
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add --toolchain stable ${{ matrix.target }}
+          rustc +stable --print cfg --target ${{ matrix.target }} | grep -qx 'target_os="macos"' \
+            || { echo "FAIL: target_os is not macos"; exit 1; }
+          echo "OK: target_os=macos"
+
+      - name: Scan sources for invalid cfg (darwin)
+        run: |
+          set -uo pipefail
+          status=0
+          grep -rnE 'target_os[[:space:]]*=[[:space:]]*"darwin"' src cpp || status=$?
+          case "$status" in
+            0) echo 'FAIL: invalid cfg target_os="darwin" found (Rust uses "macos")'; exit 1 ;;
+            1) echo 'OK: no invalid darwin cfg' ;;
+            *) echo "FAIL: cfg scan execution error (status=$status)"; exit "$status" ;;
+          esac
+
+      - name: Resolve libclang path (bindgen)
+        run: |
+          set -euo pipefail
+          DEV=$(xcode-select -p)
+          echo "LIBCLANG_PATH=$DEV/Toolchains/XcodeDefault.xctoolchain/usr/lib" >> "$GITHUB_ENV"
+          ls "$DEV/Toolchains/XcodeDefault.xctoolchain/usr/lib/libclang.dylib" >/dev/null
+          echo "OK: libclang found"
+
+      - name: Checkout vcpkg (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/vcpkg
+          ref: ${{ env.VCPKG_COMMIT }}
+          path: target/ci-vcpkg
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout rustdesk ffmpeg overlay port
+        id: rustdesk-ports
+        uses: actions/checkout@v4
+        with:
+          repository: rustdesk/rustdesk
+          path: target/ci-rustdesk
+          sparse-checkout: |
+            res/vcpkg/ffmpeg
+            res/vcpkg/mfx-dispatch
+          persist-credentials: false
+
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: target/vcpkg-cache
+          key: p53-${{ matrix.target }}-${{ env.VCPKG_COMMIT }}-${{ steps.rustdesk-ports.outputs.commit }}
+          restore-keys: |
+            macos-pb-${{ matrix.target }}-${{ env.VCPKG_COMMIT }}-
+
+      - name: Install nasm (ffmpeg assembler on x86_64)
+        if: ${{ matrix.target == 'x86_64-apple-darwin' }}
+        run: |
+          set -euo pipefail
+          if ! command -v nasm >/dev/null 2>&1; then
+            HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install nasm
+          fi
+          nasm -v
+
+      - name: Bootstrap vcpkg
+        run: |
+          set -euo pipefail
+          mkdir -p target/vcpkg-cache
+          ./target/ci-vcpkg/bootstrap-vcpkg.sh -disableMetrics
+
+      - name: Install ffmpeg (rustdesk overlay, videotoolbox)
+        run: |
+          set -euo pipefail
+          ./target/ci-vcpkg/vcpkg install \
+            --triplet "${{ matrix.triplet }}" \
+            --x-manifest-root=.github/vcpkg-macos \
+            --x-install-root="$VCPKG_ROOT/installed" \
+            --overlay-ports="${GITHUB_WORKSPACE}/target/ci-rustdesk/res/vcpkg"
+
+      - name: cargo build --lib
+        run: cargo +stable build --target ${{ matrix.target }} --lib 2>&1 | tail -40
+
+      - name: cargo test --lib (all but generated layout tests)
+        run: |
+          set -euo pipefail
+          cargo +stable test --target ${{ matrix.target }} --lib -- \
+            --skip bindgen_test_layout --nocapture 2>&1 | tail -60
+
+      - name: Record environment
+        if: always()
+        run: |
+          {
+            echo "target: ${{ matrix.target }}"
+            echo "runner arch: $(uname -m)"
+            echo "hwcodec head: $(git rev-parse HEAD)"
+            echo "vcpkg: $VCPKG_COMMIT"
+            rustc +stable -V
+          } | tee env.txt
+
+  linux-gcc:
+    name: ubuntu-24.04 / check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install toolchain and FFmpeg headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake clang libclang-dev libc++-dev \
+            libavcodec-dev libavutil-dev libavformat-dev libswscale-dev \
+            libavfilter-dev libavdevice-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # build.rs insists on $VCPKG_ROOT/installed/<triplet>/include; `cargo check`
+      # does not link, so an empty lib/ is enough and the headers come from the
+      # distro packages. Static linking of ffmpeg on Linux is out of scope here:
+      # the non-macOS code path is what this job has to cover.
+      - name: Fake the vcpkg install layout for headers only
+        run: |
+          set -euo pipefail
+          triplet=x64-linux
+          mkdir -p "$VCPKG_ROOT/installed/$triplet/include" "$VCPKG_ROOT/installed/$triplet/lib"
+          for d in /usr/include/x86_64-linux-gnu /usr/include; do
+            for h in libavcodec libavutil libavformat libswscale libavfilter libavdevice; do
+              [ -d "$d/$h" ] && ln -sfn "$d/$h" "$VCPKG_ROOT/installed/$triplet/include/$h"
+            done
+          done
+          ls -1 "$VCPKG_ROOT/installed/$triplet/include" | head
+
+      - name: cargo check --lib (compiles the C++ through build.rs)
+        run: cargo check --lib
