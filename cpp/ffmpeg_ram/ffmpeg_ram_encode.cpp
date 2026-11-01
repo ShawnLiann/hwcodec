@@ -346,10 +346,13 @@ private:
     }
 
     auto start = util::now();
+    bool no_output = false;
     while (ret >= 0 && util::elapsed_ms(start) < DECODE_TIMEOUT_MS) {
       if ((ret = avcodec_receive_packet(c_, pkt_)) < 0) {
         if (ret != AVERROR(EAGAIN)) {
           LOG_ERROR(std::string("avcodec_receive_packet failed, ret = ") + av_err2str(ret));
+        } else {
+          no_output = true;
         }
         goto _exit;
       }
@@ -363,7 +366,10 @@ private:
     }
   _exit:
     av_packet_unref(pkt_);
-    return encoded ? 0 : -1;
+    // Encoders with an output delay legitimately produce nothing on some calls; the caller has to
+    // treat that as flow control, not as a failed frame, or it will disable the encoder.
+    if (encoded || no_output) return 0;
+    return -1;
   }
 
   int fill_frame(AVFrame *frame, uint8_t *data, int data_length,
