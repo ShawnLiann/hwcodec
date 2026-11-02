@@ -22,6 +22,8 @@ struct VTPixbufEncoder {
   int width, height;
   int hevc;
   int force_keyframe;
+  int fps, kbps, gop;
+  int pixfmt; // fourcc the session was opened for; 0 means "not open yet"
   vt_out_cb cb;
   void* obj;
 };
@@ -107,43 +109,38 @@ static void vt_output(VTPixbufEncoder* e, OSStatus st, CMSampleBufferRef sb) {
   free(buf);
 }
 
-VTPixbufEncoder* vt_pixbuf_new(int width, int height, int codec /*0=h264, 1=hevc*/, int fps, int kbps,
-                               int gop, vt_out_cb cb, void* obj) {
-  VTPixbufEncoder* e = (VTPixbufEncoder*)calloc(1, sizeof(VTPixbufEncoder));
-  if (!e) return NULL;
-  e->width = width;
-  e->height = height;
-  e->hevc = codec ? 1 : 0;
-  e->force_keyframe = 1;
-  e->cb = cb;
-  e->obj = obj;
-
+// Open the session for the pixel format the capture side actually hands over. A packed BGRA surface
+// and a biplanar 420v surface both arrive here, and VT accepts a mismatched declaration silently -
+// it then converts every frame internally, which at 4K is exactly the cost the zero-copy path
+// exists to avoid. So the format comes from the first buffer, not from an assumption.
+static int vt_open(VTPixbufEncoder* e, OSType pixfmt) {
   NSDictionary* attrs = @{
-    (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
-    (id)kCVPixelBufferWidthKey : @(width),
-    (id)kCVPixelBufferHeightKey : @(height),
+    (id)kCVPixelBufferPixelFormatTypeKey : @(pixfmt),
+    (id)kCVPixelBufferWidthKey : @(e->width),
+    (id)kCVPixelBufferHeightKey : @(e->height),
     (id)kCVPixelBufferIOSurfacePropertiesKey : @{}
   };
   OSStatus rc = VTCompressionSessionCreate(
-      NULL, width, height, codec ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264, NULL,
+      NULL, e->width, e->height, e->hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264, NULL,
       (__bridge CFDictionaryRef)attrs, NULL, NULL, NULL, &e->session);
   if (rc != noErr || !e->session) {
-    free(e);
-    return NULL;
+    e->session = NULL;
+    return -1;
   }
+  e->pixfmt = (int)pixfmt;
   VTSessionSetProperty(e->session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
   VTSessionSetProperty(e->session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
-  if (fps > 0) {
+  if (e->fps > 0) {
     VTSessionSetProperty(e->session, kVTCompressionPropertyKey_ExpectedFrameRate,
-                         (__bridge CFTypeRef)@(fps));
+                         (__bridge CFTypeRef)@(e->fps));
   }
-  if (kbps > 0) {
+  if (e->kbps > 0) {
     VTSessionSetProperty(e->session, kVTCompressionPropertyKey_AverageBitRate,
-                         (__bridge CFTypeRef)@(kbps * 1000));
+                         (__bridge CFTypeRef)@(e->kbps * 1000));
   }
-  if (gop > 0) {
+  if (e->gop > 0) {
     VTSessionSetProperty(e->session, kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                         (__bridge CFTypeRef)@(gop));
+                         (__bridge CFTypeRef)@(e->gop));
   }
   // RD_VT_LATENCY=1 asks for the shallowest pipeline VT will run and for speed over quality, so a
   // frame does not sit in the session waiting on a lookahead the caller never asked for.
@@ -165,12 +162,50 @@ VTPixbufEncoder* vt_pixbuf_new(int width, int height, int codec /*0=h264, 1=hevc
     }
   }
   VTCompressionSessionPrepareToEncodeFrames(e->session);
+  return 0;
+}
+
+VTPixbufEncoder* vt_pixbuf_new(int width, int height, int codec /*0=h264, 1=hevc*/, int fps, int kbps,
+                               int gop, vt_out_cb cb, void* obj) {
+  VTPixbufEncoder* e = (VTPixbufEncoder*)calloc(1, sizeof(VTPixbufEncoder));
+  if (!e) return NULL;
+  e->width = width;
+  e->height = height;
+  e->hevc = codec ? 1 : 0;
+  e->fps = fps;
+  e->kbps = kbps;
+  e->gop = gop;
+  e->force_keyframe = 1;
+  e->cb = cb;
+  e->obj = obj;
+  // Open eagerly for the format this process expects, so session creation keeps its one-off cost out
+  // of the first frame's encode call; the first buffer reopens the session if the guess is wrong.
+  const char* nv12 = getenv("RD_PIXBUF_NV12");
+  OSType fmt = (nv12 && strcmp(nv12, "1") == 0) ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                                                : kCVPixelFormatType_32BGRA;
+  if (vt_open(e, fmt) != 0) {
+    free(e);
+    return NULL;
+  }
   return e;
 }
 
 int vt_pixbuf_encode(VTPixbufEncoder* e, void* cvpixbuf, int64_t pts) {
   CVPixelBufferRef pb = (CVPixelBufferRef)cvpixbuf;
   if (!e || !pb) return -1;
+  // The capture side picks the format, so the session is opened on the first buffer and reopened if
+  // the surface format ever changes mid-session (a codec switch or a new capture).
+  OSType pixfmt = CVPixelBufferGetPixelFormatType(pb);
+  if (!e->session || e->pixfmt != (int)pixfmt) {
+    if (e->session) {
+      VTCompressionSessionCompleteFrames(e->session, kCMTimeInvalid);
+      VTCompressionSessionInvalidate(e->session);
+      CFRelease(e->session);
+      e->session = NULL;
+    }
+    e->force_keyframe = 1;
+    if (vt_open(e, pixfmt) != 0) return -1;
+  }
   // The captured buffer is BGRA produced from the screen; keep the matrix the decoder-side has
   // always used (BT.601 limited), otherwise VT picks another one and the image shifts.
   if (!CVBufferHasAttachment(pb, kCVImageBufferYCbCrMatrixKey)) {
