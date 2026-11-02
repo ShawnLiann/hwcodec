@@ -145,6 +145,25 @@ VTPixbufEncoder* vt_pixbuf_new(int width, int height, int codec /*0=h264, 1=hevc
     VTSessionSetProperty(e->session, kVTCompressionPropertyKey_MaxKeyFrameInterval,
                          (__bridge CFTypeRef)@(gop));
   }
+  // RD_VT_LATENCY=1 asks for the shallowest pipeline VT will run and for speed over quality, so a
+  // frame does not sit in the session waiting on a lookahead the caller never asked for.
+  const char* latency = getenv("RD_VT_LATENCY");
+  if (latency && strcmp(latency, "1") == 0) {
+    VTSessionSetProperty(e->session, kVTCompressionPropertyKey_MaxFrameDelayCount,
+                         (__bridge CFTypeRef)@(1));
+    VTSessionSetProperty(e->session, kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
+                         kCFBooleanTrue);
+  }
+  // RD_VT_FPS=<n> overrides the expected frame rate, which otherwise arrives as the negotiated rate
+  // and can pin the encoder at whatever the client asked for.
+  const char* fps_override = getenv("RD_VT_FPS");
+  if (fps_override) {
+    int f = atoi(fps_override);
+    if (f > 0) {
+      VTSessionSetProperty(e->session, kVTCompressionPropertyKey_ExpectedFrameRate,
+                           (__bridge CFTypeRef)@(f));
+    }
+  }
   VTCompressionSessionPrepareToEncodeFrames(e->session);
   return e;
 }
