@@ -46,6 +46,12 @@ void *ffmpeg_ram_new_decoder(const char *name, int device_type,
                              int thread_count, RamDecodeCallback callback);
 int ffmpeg_ram_encode(void *encoder, const uint8_t *data, int length,
                       const void *obj, int64_t ms);
+
+/* `obj` is a CALL-SCOPED context: it is only valid until ffmpeg_ram_decode()
+ * returns. The decoder calls the decode callback (and, on macOS, the pixel
+ * buffer callback) synchronously from inside that call, possibly several times,
+ * and never touches `obj` again afterwards. The callee must not store it, and a
+ * callback must not keep anything derived from it past its own return. */
 int ffmpeg_ram_decode(void *decoder, const uint8_t *data, int length,
                       const void *obj);
 void ffmpeg_ram_free_encoder(void *encoder);

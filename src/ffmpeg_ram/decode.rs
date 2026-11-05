@@ -67,38 +67,62 @@ impl std::fmt::Display for DecodeFrame {
     }
 }
 
-/// Per-decode output state. Also the `obj` handed to both the software
-/// callback and the pixel-buffer callback, so they share one transaction view:
-/// a software frame clears the pending GPU frame of the same call, which makes
-/// "last decoded frame wins" hold across mixed frames.
-pub struct DecodeOutput {
+/// Everything one `decode()` call produced.
+///
+/// Returned by value, so the caller owns the frames and the pixel buffer: there
+/// is no shared context object parked on the decoder, and no window in which a
+/// previous call's output can still be read.
+pub struct DecodedFrames {
+    pub frames: Vec<DecodeFrame>,
+    #[cfg(target_os = "macos")]
+    pub pixelbuffer: Option<PixelBufferFrame>,
+}
+
+/// The `obj` pointer the C decoder sees for the duration of one call.
+///
+/// It is created inside `decode()`, lives on that call's stack and dies with it:
+/// the C side may use it inside a callback and must never retain it. That is the
+/// whole lifetime contract, and it is why the two callbacks no longer share a
+/// long-lived allocation.
+struct DecodeCall<'a> {
     frames: Vec<DecodeFrame>,
     #[cfg(target_os = "macos")]
     pixelbuffer: Option<PixelBufferFrame>,
-    /// The caller's "can you present GPU frames" flag, shared by reference so
-    /// the answer can change between frames without touching the decoder.
+    /// Borrow of the decoder's own "can you present GPU frames" flag, so the
+    /// answer can change between calls -- or between frames -- without the
+    /// caller touching the decoder.
     ///
     /// `None` means the caller never asked for GPU frames, and the callback then
     /// rejects every frame: delivery is opt-in, because accepting one makes the
     /// decoder skip the software transfer for that frame.
-    #[cfg(target_os = "macos")]
-    pixelbuffer_wanted: Option<Arc<AtomicBool>>,
+    ///
+    /// Present on every platform so the struct keeps one shape; only the macOS
+    /// pixel-buffer callback reads it.
+    #[allow(dead_code)]
+    wanted: Option<&'a AtomicBool>,
 }
 
-impl DecodeOutput {
-    fn new() -> Self {
+impl<'a> DecodeCall<'a> {
+    fn new(wanted: Option<&'a AtomicBool>) -> Self {
         Self {
             frames: vec![],
             #[cfg(target_os = "macos")]
             pixelbuffer: None,
-            #[cfg(target_os = "macos")]
-            pixelbuffer_wanted: None,
+            wanted,
         }
     }
 
-    fn clear(&mut self) {
-        self.frames.clear();
-        // Transaction boundary: never answer with a frame from a previous call.
+    fn finish(self) -> DecodedFrames {
+        DecodedFrames {
+            frames: self.frames,
+            #[cfg(target_os = "macos")]
+            pixelbuffer: self.pixelbuffer,
+        }
+    }
+
+    /// A software frame wins over a GPU frame of the same call: the caller must
+    /// not present an older surface over the frame it just decoded.
+    fn software_frame_wins(&mut self) {
         #[cfg(target_os = "macos")]
         {
             self.pixelbuffer = None;
@@ -108,7 +132,10 @@ impl DecodeOutput {
 
 pub struct Decoder {
     codec: *mut c_void,
-    output: *mut DecodeOutput,
+    /// The caller's switch, kept here instead of in a shared output object; each
+    /// decode call borrows it for the length of that call.
+    #[cfg(target_os = "macos")]
+    pixelbuffer_wanted: Option<Arc<AtomicBool>>,
     pub ctx: DecodeContext,
 }
 
@@ -135,34 +162,39 @@ impl Decoder {
 
             Ok(Decoder {
                 codec,
-                output: Box::into_raw(Box::new(DecodeOutput::new())),
+                #[cfg(target_os = "macos")]
+                pixelbuffer_wanted: None,
                 ctx,
             })
         }
     }
 
-    pub fn decode(&mut self, packet: &[u8]) -> Result<&mut Vec<DecodeFrame>, i32> {
-        // No `&mut DecodeOutput` may be alive while `ffmpeg_ram_decode` runs: the C
-        // side calls `callback` synchronously, and that callback reaches this same
-        // allocation through the raw pointer and takes its own reference to it.
-        // Two live `&mut`s to one object violate the aliasing rules even when one
-        // thread touches both, so the clear and the read each borrow through the
-        // raw pointer for the length of a statement, and the FFI call runs with no
-        // borrow alive at all.
-        let output = self.output;
+    /// Decode one packet. The returned [`DecodedFrames`] belongs to the caller:
+    /// this call drops every reference to it before returning, so nothing from
+    /// this call can be read once the value is gone.
+    ///
+    /// `obj` is this call's stack context. The C side calls the callbacks
+    /// synchronously while `ffmpeg_ram_decode` runs, so no reference derived from
+    /// it outlives the call; the callbacks only borrow through the raw pointer
+    /// for the length of a statement, which is why no `&mut` is kept alive across
+    /// the FFI boundary.
+    pub fn decode(&mut self, packet: &[u8]) -> Result<DecodedFrames, i32> {
+        #[cfg(target_os = "macos")]
+        let mut call = DecodeCall::new(self.pixelbuffer_wanted.as_deref());
+        #[cfg(not(target_os = "macos"))]
+        let mut call = DecodeCall::new(None);
         unsafe {
-            (*output).clear();
             let ret = ffmpeg_ram_decode(
                 self.codec,
                 packet.as_ptr(),
                 packet.len() as c_int,
-                output as *const c_void,
+                &mut call as *mut DecodeCall as *mut c_void,
             );
 
             if ret < 0 {
                 Err(ret)
             } else {
-                Ok(&mut (*output).frames)
+                Ok(call.finish())
             }
         }
     }
@@ -194,7 +226,7 @@ impl Decoder {
             return;
         }
 
-        let output = &mut *(obj as *mut DecodeOutput);
+        let call = &mut *(obj as *mut DecodeCall);
         let datas = from_raw_parts(datas, AV_NUM_DATA_POINTERS as _);
         let linesizes = from_raw_parts(linesizes, AV_NUM_DATA_POINTERS as _);
 
@@ -244,12 +276,9 @@ impl Decoder {
             frame.linesize.push(linesizes[1]);
             frame.linesize.push(linesizes[2]);
 
-            // A software frame wins over a GPU frame of the same transaction.
-            #[cfg(target_os = "macos")]
-            {
-                output.pixelbuffer = None;
-            }
-            output.frames.push(frame);
+            // A software frame wins over a GPU frame of the same call.
+            call.software_frame_wins();
+            call.frames.push(frame);
         } else if pixfmt == AVPixelFormat::AV_PIX_FMT_NV12 as c_int {
             let y = from_raw_parts(datas[0], (linesizes[0] * height) as usize).to_vec();
             let uv = from_raw_parts(datas[1], (linesizes[1] * height / 2) as usize).to_vec();
@@ -260,40 +289,12 @@ impl Decoder {
             frame.linesize.push(linesizes[0]);
             frame.linesize.push(linesizes[1]);
 
-            // A software frame wins over a GPU frame of the same transaction.
-            #[cfg(target_os = "macos")]
-            {
-                output.pixelbuffer = None;
-            }
-            output.frames.push(frame);
+            // A software frame wins over a GPU frame of the same call.
+            call.software_frame_wins();
+            call.frames.push(frame);
         } else {
             error!("unsupported pixfmt {}", pixfmt as i32);
         }
-    }
-
-    /// The software frames produced by the last `decode()` call.
-    ///
-    /// Use this instead of the `decode()` return value when the caller must
-    /// also read [`Self::take_pixelbuffer`]: `decode()` returns a mutable borrow
-    /// of the decoder, so the two cannot overlap.
-    pub fn last_frames(&self) -> &[DecodeFrame] {
-        unsafe { &(*self.output).frames }
-    }
-
-    /// Take the GPU frame delivered to this decode call, if any.
-    ///
-    /// `None` means this call produced no direct frame: either the decoder
-    /// rejected it, the format is not directly deliverable, or a software frame
-    /// won in the same transaction. The caller must not fall back to a frame
-    /// from a previous call.
-    #[cfg(target_os = "macos")]
-    pub fn take_pixelbuffer(&mut self) -> Option<PixelBufferFrame> {
-        unsafe { (&mut *self.output).pixelbuffer.take() }
-    }
-
-    #[cfg(target_os = "macos")]
-    pub fn has_pixelbuffer(&self) -> bool {
-        unsafe { (&*self.output).pixelbuffer.is_some() }
     }
 
     /// Share the caller's "can you present GPU frames" flag with this decoder.
@@ -310,7 +311,7 @@ impl Decoder {
     /// the change applies from the next decoded frame.
     #[cfg(target_os = "macos")]
     pub fn set_pixelbuffer_wanted(&mut self, wanted: Arc<AtomicBool>) {
-        unsafe { (&mut *self.output).pixelbuffer_wanted = Some(wanted) };
+        self.pixelbuffer_wanted = Some(wanted);
     }
 
     /// Borrowed-descriptor callback from the decoder.
@@ -327,14 +328,14 @@ impl Decoder {
         if obj.is_null() || frame.is_null() {
             return PIXELBUFFER_REJECTED;
         }
-        let output = &mut *(obj as *mut DecodeOutput);
+        let call = &mut *(obj as *mut DecodeCall);
         // Rejecting here is what makes the C++ side fall back to its software
         // transfer on this very frame, so the renderer never has a frame taken
         // away from it.
         //
         // Delivery is opt-in: a decoder the caller never configured keeps
         // producing software frames, exactly like before this API existed.
-        let Some(wanted) = &output.pixelbuffer_wanted else {
+        let Some(wanted) = call.wanted else {
             return PIXELBUFFER_REJECTED;
         };
         if !wanted.load(Ordering::Relaxed) {
@@ -346,7 +347,7 @@ impl Decoder {
         }
         match PixelBufferFrame::retain_from_borrowed(frame) {
             Some(pixelbuffer) => {
-                output.pixelbuffer = Some(pixelbuffer);
+                call.pixelbuffer = Some(pixelbuffer);
                 PIXELBUFFER_ACCEPTED
             }
             None => PIXELBUFFER_REJECTED,
@@ -527,12 +528,12 @@ impl Drop for Decoder {
     fn drop(&mut self) {
         unsafe {
             // Remove the callback first: after this no callback can reach the
-            // output state, so freeing it below cannot race a decode.
+            // decoder, so freeing it below cannot race a decode. No per-call
+            // state to free any more -- each decode call owns its own output.
             #[cfg(target_os = "macos")]
             ffmpeg_ram_set_pixelbuffer_callback(self.codec, None);
             ffmpeg_ram_free_decoder(self.codec);
             self.codec = std::ptr::null_mut();
-            let _ = Box::from_raw(self.output);
         }
     }
 }
@@ -540,10 +541,10 @@ impl Drop for Decoder {
 /// Transaction-ordering tests for the GPU-frame path.
 ///
 /// These drive both callbacks directly, so they need no decoder, no bitstream
-/// and no GPU: they pin the state machine only ("does this decode call end up
-/// with the last decoded frame, and exactly one delivery"). The per-iteration
-/// reset inside `do_decode()` still requires a real VideoToolbox decode and is
-/// verified on hardware, not here.
+/// and no GPU: they pin the state machine only ("does one decode call end up
+/// with the last decoded frame, and exactly one delivery"). Each call's output
+/// is a plain value, so "the previous call cannot be read" is a type-level fact
+/// here and only the ordering still needs a test.
 #[cfg(all(test, target_os = "macos"))]
 mod output_tests {
     use super::*;
@@ -552,16 +553,8 @@ mod output_tests {
     const W: i32 = 16;
     const H: i32 = 16;
 
-    /// An output that asked for GPU frames; delivery is opt-in, so a bare
-    /// `DecodeOutput::new()` would reject everything.
-    fn output_wanting_gpu(wanted: bool) -> DecodeOutput {
-        let mut output = DecodeOutput::new();
-        output.pixelbuffer_wanted = Some(std::sync::Arc::new(AtomicBool::new(wanted)));
-        output
-    }
-
     /// Push one software (NV12) frame through the real callback.
-    fn software_frame(output: &mut DecodeOutput) {
+    fn software_frame(call: &mut DecodeCall<'_>) {
         let mut y = vec![0u8; (W * H) as usize];
         let mut uv = vec![0u8; (W * H / 2) as usize];
         let mut linesizes = [0 as c_int; AV_NUM_DATA_POINTERS as _];
@@ -572,7 +565,7 @@ mod output_tests {
         datas[1] = uv.as_mut_ptr();
         unsafe {
             Decoder::callback(
-                output as *mut _ as *const c_void,
+                call as *mut _ as *const c_void,
                 W,
                 H,
                 AVPixelFormat::AV_PIX_FMT_NV12 as c_int,
@@ -584,14 +577,14 @@ mod output_tests {
     }
 
     /// Deliver one GPU frame through the real callback; returns its verdict.
-    fn direct_frame(output: &mut DecodeOutput, pixfmt: u32, raw: *mut c_void) -> c_int {
+    fn direct_frame(call: &mut DecodeCall<'_>, pixfmt: u32, raw: *mut c_void) -> c_int {
         let frame = FfiPixelBufferFrame {
             pixel_buffer: raw,
             width: W,
             height: H,
             pixfmt,
         };
-        unsafe { Decoder::pixelbuffer_callback(output as *mut _ as *mut c_void, &frame) }
+        unsafe { Decoder::pixelbuffer_callback(call as *mut _ as *mut c_void, &frame) }
     }
 
     #[test]
@@ -604,35 +597,36 @@ mod output_tests {
             eprintln!("skip: CVPixelBufferCreate failed in this environment");
             return;
         };
-        let mut output = DecodeOutput::new();
+        let mut call = DecodeCall::new(None);
         assert!(
-            output.pixelbuffer_wanted.is_none(),
+            call.wanted.is_none(),
             "a decoder without a caller flag must not want GPU frames"
         );
         assert_eq!(
             direct_frame(
-                &mut output,
+                &mut call,
                 crate::ffmpeg_ram::pixelbuffer::PIXEL_FORMAT_420F,
                 raw
             ),
             PIXELBUFFER_REJECTED
         );
         assert!(
-            output.pixelbuffer.is_none(),
+            call.pixelbuffer.is_none(),
             "a rejected frame must retain nothing"
         );
 
         // ... and it accepts once the caller says it can present them.
-        output.pixelbuffer_wanted = Some(std::sync::Arc::new(AtomicBool::new(true)));
+        let wanted = AtomicBool::new(true);
+        let mut call = DecodeCall::new(Some(&wanted));
         assert_eq!(
             direct_frame(
-                &mut output,
+                &mut call,
                 crate::ffmpeg_ram::pixelbuffer::PIXEL_FORMAT_420F,
                 raw
             ),
             PIXELBUFFER_ACCEPTED
         );
-        assert!(output.pixelbuffer.is_some());
+        assert!(call.pixelbuffer.is_some());
         release_buffer(raw);
     }
 
@@ -642,30 +636,27 @@ mod output_tests {
             eprintln!("skip: CVPixelBufferCreate failed in this environment");
             return;
         };
-        let mut output = output_wanting_gpu(true);
-        software_frame(&mut output);
-        assert_eq!(output.frames.len(), 1);
-        assert!(output.pixelbuffer.is_none());
+        let wanted = AtomicBool::new(true);
+        let mut call = DecodeCall::new(Some(&wanted));
+        software_frame(&mut call);
+        assert_eq!(call.frames.len(), 1);
+        assert!(call.pixelbuffer.is_none());
 
         assert_eq!(
             direct_frame(
-                &mut output,
+                &mut call,
                 crate::ffmpeg_ram::pixelbuffer::PIXEL_FORMAT_420F,
                 raw
             ),
             PIXELBUFFER_ACCEPTED
         );
         // The GPU frame arrived last, so it is the output of this call.
-        assert!(output.pixelbuffer.is_some());
+        assert!(call.pixelbuffer.is_some());
         assert_eq!(
-            output.frames.len(),
+            call.frames.len(),
             1,
             "software frames are not cleared by a GPU frame"
         );
-
-        output.clear();
-        assert!(output.pixelbuffer.is_none());
-        assert!(output.frames.is_empty());
         release_buffer(raw);
     }
 
@@ -675,22 +666,23 @@ mod output_tests {
             eprintln!("skip: CVPixelBufferCreate failed in this environment");
             return;
         };
-        let mut output = output_wanting_gpu(true);
+        let wanted = AtomicBool::new(true);
+        let mut call = DecodeCall::new(Some(&wanted));
         assert_eq!(
             direct_frame(
-                &mut output,
+                &mut call,
                 crate::ffmpeg_ram::pixelbuffer::PIXEL_FORMAT_420V,
                 raw
             ),
             PIXELBUFFER_ACCEPTED
         );
-        assert!(output.pixelbuffer.is_some());
+        assert!(call.pixelbuffer.is_some());
 
-        software_frame(&mut output);
-        // A software frame wins in the same transaction: no stale GPU frame may
+        software_frame(&mut call);
+        // A software frame wins in the same call: no stale GPU frame may
         // survive, otherwise the renderer would show the previous one.
-        assert!(output.pixelbuffer.is_none());
-        assert_eq!(output.frames.len(), 1);
+        assert!(call.pixelbuffer.is_none());
+        assert_eq!(call.frames.len(), 1);
         release_buffer(raw);
     }
 
@@ -701,13 +693,14 @@ mod output_tests {
             eprintln!("skip: CVPixelBufferCreate failed in this environment");
             return;
         };
-        let mut output = output_wanting_gpu(true);
+        let wanted = AtomicBool::new(true);
+        let mut call = DecodeCall::new(Some(&wanted));
         assert_eq!(
-            direct_frame(&mut output, 0x4247_5241, raw),
+            direct_frame(&mut call, 0x4247_5241, raw),
             PIXELBUFFER_REJECTED
         );
         assert!(
-            output.pixelbuffer.is_none(),
+            call.pixelbuffer.is_none(),
             "a rejected frame must retain nothing"
         );
         release_buffer(raw);
@@ -715,16 +708,17 @@ mod output_tests {
 
     #[test]
     fn null_descriptor_is_rejected() {
-        let mut output = output_wanting_gpu(true);
+        let wanted = AtomicBool::new(true);
+        let mut call = DecodeCall::new(Some(&wanted));
         assert_eq!(
             direct_frame(
-                &mut output,
+                &mut call,
                 crate::ffmpeg_ram::pixelbuffer::PIXEL_FORMAT_420F,
                 std::ptr::null_mut()
             ),
             PIXELBUFFER_REJECTED
         );
-        assert!(output.pixelbuffer.is_none());
+        assert!(call.pixelbuffer.is_none());
 
         // A null obj must be rejected as well, not dereferenced.
         let frame = FfiPixelBufferFrame {
@@ -740,24 +734,28 @@ mod output_tests {
     }
 
     #[test]
-    fn clear_drops_the_pending_frame_of_the_previous_call() {
+    fn a_new_call_never_carries_the_previous_frame() {
         let Some(raw) = create_buffer(crate::ffmpeg_ram::pixelbuffer::PIXEL_FORMAT_420F) else {
             eprintln!("skip: CVPixelBufferCreate failed in this environment");
             return;
         };
-        let mut output = output_wanting_gpu(true);
+        let wanted = AtomicBool::new(true);
+        let mut first = DecodeCall::new(Some(&wanted));
         assert_eq!(
             direct_frame(
-                &mut output,
+                &mut first,
                 crate::ffmpeg_ram::pixelbuffer::PIXEL_FORMAT_420F,
                 raw
             ),
             PIXELBUFFER_ACCEPTED
         );
-        assert!(output.pixelbuffer.is_some());
-        output.clear();
-        // The next call must not answer with this frame.
-        assert!(output.pixelbuffer.is_none());
+        assert!(first.pixelbuffer.is_some());
+
+        // The next call starts empty by construction: there is no slot left on
+        // the decoder to answer from.
+        let second = DecodeCall::new(Some(&wanted));
+        assert!(second.pixelbuffer.is_none());
+        assert!(second.frames.is_empty());
         release_buffer(raw);
     }
 }
