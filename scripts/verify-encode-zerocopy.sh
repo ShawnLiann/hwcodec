@@ -27,7 +27,7 @@ clang++ "$WORK/vtp.o" "$WORK/test.o" \
 for args in "1920 1080 0" "1920 1080 1" "4096 2304 0" "4096 2304 1"; do
   line=$("$WORK/test_vt_pixbuf" $args) || { echo "FAIL encode: $args"; fail=1; continue; }
   echo "  $line"
-  if [ "$STRICT" = 1 ]; then
+  if [ "${STRICT:-}" = 1 ]; then
     echo "$line" | grep -q "keys=1" || { echo "  FAIL no keyframe: $args"; fail=1; }
   else
     echo "$line" | grep -qE "bytes=[1-9][0-9]*" || { echo "  FAIL no bitstream: $args"; fail=1; }
