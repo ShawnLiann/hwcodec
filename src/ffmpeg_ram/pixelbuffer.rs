@@ -31,6 +31,7 @@ pub(crate) const PIXELBUFFER_REJECTED: c_int = 0;
 extern "C" {
     fn CVPixelBufferRetain(pixel_buffer: *mut c_void) -> *mut c_void;
     fn CVPixelBufferRelease(pixel_buffer: *mut c_void);
+    fn CVPixelBufferGetIOSurface(pixel_buffer: *mut c_void) -> *mut c_void;
 }
 
 /// Whether a `CVPixelBuffer` pixel format can be sampled directly by the
@@ -38,6 +39,19 @@ extern "C" {
 /// P010 and everything else must go through the software path).
 pub(crate) fn is_direct_deliverable(pixfmt: u32) -> bool {
     pixfmt == PIXEL_FORMAT_420F || pixfmt == PIXEL_FORMAT_420V
+}
+
+/// Whether the decoded buffer is backed by an IOSurface, i.e. whether the
+/// renderer can map it as a texture at all.
+///
+/// Preventive, not a bug fix: every hardware-decoded frame we have seen is
+/// IOSurface-backed and we have no report of one that is not. It is here
+/// because a buffer without an IOSurface cannot be sampled, and the accept or
+/// reject decision has to be made before the callback returns -- afterwards the
+/// software copy of that frame is already gone, so a frame the renderer cannot
+/// use would simply be lost. Rejecting costs one software transfer instead.
+pub fn is_iosurface_backed(pixel_buffer: *mut c_void) -> bool {
+    !pixel_buffer.is_null() && unsafe { !CVPixelBufferGetIOSurface(pixel_buffer).is_null() }
 }
 
 /// An owned reference to a decoded `CVPixelBuffer`.
@@ -186,6 +200,22 @@ mod tests {
             pixfmt: PIXEL_FORMAT_420F,
         };
         assert!(unsafe { PixelBufferFrame::retain_from_borrowed(&frame) }.is_none());
+    }
+
+    #[test]
+    fn a_buffer_without_an_iosurface_is_not_deliverable() {
+        // `CVPixelBufferCreate` with null attributes returns a buffer backed by
+        // plain memory: exactly the case this preventive check exists for.
+        let Some(raw) = create_buffer(PIXEL_FORMAT_420F) else {
+            eprintln!("skip: CVPixelBufferCreate failed in this environment");
+            return;
+        };
+        assert!(
+            !is_iosurface_backed(raw),
+            "a null-attribute buffer has no IOSurface"
+        );
+        assert!(!is_iosurface_backed(std::ptr::null_mut()));
+        release_buffer(raw);
     }
 
     #[test]

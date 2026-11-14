@@ -7,7 +7,8 @@ use crate::ffmpeg::{init_av_log, AVHWDeviceType::*};
 use crate::ffmpeg_ram::{
     ffmpeg_ram_set_pixelbuffer_callback,
     pixelbuffer::{
-        is_direct_deliverable, PixelBufferFrame, PIXELBUFFER_ACCEPTED, PIXELBUFFER_REJECTED,
+        is_direct_deliverable, is_iosurface_backed, PixelBufferFrame, PIXELBUFFER_ACCEPTED,
+        PIXELBUFFER_REJECTED,
     },
     FfiPixelBufferFrame,
 };
@@ -378,7 +379,10 @@ impl Decoder {
             return PIXELBUFFER_REJECTED;
         }
         let frame = &*frame;
-        if !is_direct_deliverable(frame.pixfmt) || frame.pixel_buffer.is_null() {
+        if !is_direct_deliverable(frame.pixfmt)
+            || frame.pixel_buffer.is_null()
+            || !is_iosurface_backed(frame.pixel_buffer)
+        {
             return PIXELBUFFER_REJECTED;
         }
         match PixelBufferFrame::retain_from_borrowed(frame) {
