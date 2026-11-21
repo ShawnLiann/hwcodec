@@ -69,9 +69,8 @@ public:
   ~FFmpegRamDecoder() {}
 
 #ifdef RAM_DEC_SURFACE
-  // The getter hands out a pointer that is only valid until the next decode,
-  // so the next decode starts by dropping it. A packet that carries more than
-  // one frame takes the same drop inside the receive loop.
+  // The pointer handed out by ffmpeg_ram_decode_surface() is only valid until
+  // the next decode, so every decode starts by dropping it.
   void release_last_pb() {
     if (last_pb_) {
       CFRelease(last_pb_);
@@ -367,12 +366,37 @@ private:
 } // namespace
 
 #ifdef RAM_DEC_SURFACE
-// Borrowed: the surface stays owned by the decoder and is released on the next
-// decode or in ffmpeg_ram_free_decoder(). Retain it to keep it longer.
-extern "C" void *ffmpeg_ram_decode_pixelbuffer(FFmpegRamDecoder *decoder) {
+// The only way to ask for a surface, and it answers in the same call: the
+// pointer comes out here instead of through a second exported symbol. The
+// surface stays owned by the decoder, released on the next decode or in
+// ffmpeg_ram_free_decoder(); retain it to keep it longer.
+extern "C" int ffmpeg_ram_decode_surface(FFmpegRamDecoder *decoder,
+                                         const uint8_t *data, int length,
+                                         const void *obj,
+                                         void **surface_out) {
+  if (!surface_out)
+    return HWCODEC_ERR_COMMON;
+  *surface_out = NULL;
   if (!decoder)
-    return NULL;
-  return decoder->last_pixelbuffer();
+    return HWCODEC_ERR_COMMON;
+  try {
+    int ret = decoder->decode(data, length, obj, true);
+    if (DataFormat::H265 == decoder->data_format_ &&
+        util_decode::has_flag_could_not_find_ref_with_poc()) {
+      return HWCODEC_ERR_HEVC_COULD_NOT_FIND_POC;
+    }
+    if (ret != 0)
+      return HWCODEC_ERR_COMMON;
+    *surface_out = decoder->last_pixelbuffer();
+    // A success without a surface would be the empty contract this function
+    // exists to avoid, so it is reported as an error.
+    return *surface_out ? HWCODEC_SUCCESS : HWCODEC_ERR_COMMON;
+  } catch (const std::exception &e) {
+    LOG_ERROR(std::string("ffmpeg_ram_decode_surface exception:") + e.what());
+  } catch (...) {
+    LOG_ERROR("ffmpeg_ram_decode_surface: unknown exception");
+  }
+  return HWCODEC_ERR_COMMON;
 }
 #endif
 
@@ -415,10 +439,9 @@ ffmpeg_ram_new_decoder(const char *name, int device_type, int thread_count,
 }
 
 extern "C" int ffmpeg_ram_decode(FFmpegRamDecoder *decoder, const uint8_t *data,
-                                 int length, const void *obj,
-                                 int wants_surface) {
+                                 int length, const void *obj) {
   try {
-    int ret = decoder->decode(data, length, obj, wants_surface != 0);
+    int ret = decoder->decode(data, length, obj, false);
     if (DataFormat::H265 == decoder->data_format_ && util_decode::has_flag_could_not_find_ref_with_poc()) {
       return HWCODEC_ERR_HEVC_COULD_NOT_FIND_POC;
     } else {
