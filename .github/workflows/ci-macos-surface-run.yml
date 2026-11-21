@@ -1,0 +1,70 @@
+name: macOS surface run-check (scratch)
+
+# Scratch branch only: this workflow exists so the Apple-only ffmpeg_ram surface
+# path is *executed* in CI, not just compiled. It runs ci/run-check-macos.sh,
+# which links the crate against a minimal static ffmpeg and runs
+# tests/macos_surface.rs on the runner's real VideoToolbox decoder.
+#
+# It is deliberately NOT part of the change under review: D4 keeps it on the
+# fork's scratch branch and never opens it as a PR (REGROW-RULES G2: no touching
+# the upstream tree's CI).
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'ci/macos-run-check-*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  run-check:
+    name: surface test on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-14 dropped: two runs in a row were cancelled for runner capacity
+        # before the job started, which reads as a red check for a reason that has
+        # nothing to do with the code. macos-15 is arm64 as well, so coverage is
+        # unchanged.
+        os: [macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record the runner
+        run: |
+          uname -a
+          sw_vers
+          xcode-select -p
+          rustc --version && cargo --version
+
+      - name: Cache the static ffmpeg build
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/regrow-compile/ff7
+          key: ffmpeg-7.1.1-static-vt-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Link and run the surface test
+        run: bash ci/run-check-macos.sh
+        env:
+          REGROW_SCRATCH: ${{ runner.temp }}/regrow-compile
+
+      - name: Upload the run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-check-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/regrow-compile/**/*.log
+          if-no-files-found: ignore
+          retention-days: 14
