@@ -11,6 +11,13 @@
 # CI (and falls back to the local scratch when run by hand), and the ffmpeg build
 # is cached between runs by the workflow, not by this script.
 #
+# `--disable-iconv` is load-bearing on CI: configure autodetects iconv and then
+# avcodec's decode.o references iconv_open/iconv_close, which the final link does
+# not resolve on arm64 macOS (measured: run 44873767144, "Undefined symbols for
+# architecture arm64: _iconv_close ... _ff_decode_preinit"). Nothing in the
+# surface path needs charset conversion, so it is turned off instead of adding
+# -liconv to a link line build.rs owns.
+#
 # Usage: bash ci/run-check-macos.sh       Exit: 0 = linked and all tests passed.
 set -uo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -30,7 +37,8 @@ if [ ! -f "$PREFIX/lib/libavcodec.a" ]; then
   cd "$FF" || exit 2
   ./configure --prefix="$PREFIX" --disable-programs --disable-doc --disable-everything \
     --disable-shared --enable-static --enable-decoder=h264,hevc \
-    --enable-parser=h264,hevc --enable-hwaccel=h264_videotoolbox --enable-videotoolbox || exit 2
+    --enable-parser=h264,hevc --enable-hwaccel=h264_videotoolbox --enable-videotoolbox \
+    --disable-iconv || exit 2
   make -j"$(sysctl -n hw.ncpu)" && make install || exit 2
 fi
 
