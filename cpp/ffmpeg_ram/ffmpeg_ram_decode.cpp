@@ -19,6 +19,14 @@ extern "C" {
 #include <libavutil/hwcontext_d3d11va.h>
 #endif
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if defined(__APPLE__) && TARGET_OS_OSX
+#include <CoreVideo/CoreVideo.h>
+#define RAM_DEC_SURFACE 1
+#endif
+
 #include "common.h"
 #include "system.h"
 
@@ -60,7 +68,22 @@ public:
 
   ~FFmpegRamDecoder() {}
 
+#ifdef RAM_DEC_SURFACE
+  // The getter hands out a pointer that is only valid until the next decode,
+  // so the next decode starts by dropping it. A packet that carries more than
+  // one frame takes the same drop inside the receive loop.
+  void release_last_pb() {
+    if (last_pb_) {
+      CFRelease(last_pb_);
+      last_pb_ = NULL;
+    }
+  }
+#endif
+
   void free_decoder() {
+#ifdef RAM_DEC_SURFACE
+    release_last_pb();
+#endif
     if (frame_)
       av_frame_free(&frame_);
     if (pkt_)
@@ -155,25 +178,57 @@ public:
     return 0;
   }
 
-  int decode(const uint8_t *data, int length, const void *obj) {
+#ifdef RAM_DEC_SURFACE
+  // Borrowed: the decoder keeps ownership and drops it on the next decode or
+  // in free_decoder(). A caller that keeps it longer has to CFRetain it.
+  CVPixelBufferRef last_pixelbuffer() const { return last_pb_; }
+#endif
+
+  // wants_surface belongs to this call only: nothing on the object remembers
+  // it, so the same decoder can copy to software on the next packet.
+  int decode(const uint8_t *data, int length, const void *obj,
+             bool wants_surface) {
     int ret = -1;
 #ifdef CFG_PKG_TRACE
     in_++;
     LOG_DEBUG(std::string("delay DI: in:") + in_ + " out:" + out_);
 #endif
 
+#ifdef RAM_DEC_SURFACE
+    // One surface per decode, including the calls that decode nothing: a
+    // caller must never read the surface an earlier call produced.
+    release_last_pb();
+#endif
     if (!data || !length) {
       LOG_ERROR(std::string("illegal decode parameter"));
       return -1;
     }
+#ifdef RAM_DEC_SURFACE
+    if (wants_surface && device_type_ != AV_HWDEVICE_TYPE_VIDEOTOOLBOX) {
+      LOG_ERROR(std::string(
+          "a surface was asked of a decoder that is not videotoolbox"));
+      return -1;
+    }
+#else
+    (void)wants_surface;
+#endif
     pkt_->data = (uint8_t *)data;
     pkt_->size = length;
-    ret = do_decode(obj);
+    ret = do_decode(obj, wants_surface);
     return ret;
   }
 
 private:
-  int do_decode(const void *obj) {
+#ifdef RAM_DEC_SURFACE
+  // Retained copy of data[3]: the decoder reuses the AVFrame on the next
+  // receive, so the surface has to outlive it.
+  CVPixelBufferRef last_pb_ = NULL;
+#endif
+
+  int do_decode(const void *obj, bool wants_surface) {
+#ifndef RAM_DEC_SURFACE
+    (void)wants_surface;
+#endif
     int ret;
     AVFrame *tmp_frame = NULL;
     bool decoded = false;
@@ -197,6 +252,35 @@ private:
           LOG_ERROR(std::string("hw_frames_ctx is NULL"));
           goto _exit;
         }
+#ifdef RAM_DEC_SURFACE
+        // VideoToolbox decodes straight into a CVPixelBufferRef carried in
+        // data[3]. When the caller asked for a surface, hand that out instead
+        // of copying it to RAM; the software transfer below stays the only
+        // path for every other decoder.
+        if (wants_surface) {
+          // One decode, one contract: a caller that asked for a surface cannot
+          // read a software frame, so a fallback is an error, not a silent
+          // hand-over to a callback that is not listening.
+          if (frame_->format != AV_PIX_FMT_VIDEOTOOLBOX || !frame_->data[3]) {
+            LOG_ERROR(std::string("wants a surface, decoded a software frame"));
+            goto _exit;
+          }
+          CVPixelBufferRef pb = (CVPixelBufferRef)frame_->data[3];
+          // A surface pool can hand the same buffer back for the next frame;
+          // releasing ours after retaining that address would cancel the
+          // retain. Only a different buffer means the old one is ours to drop.
+          if (pb != last_pb_)
+            release_last_pb();
+          CFRetain(pb);
+          last_pb_ = pb;
+          decoded = true;
+#ifdef CFG_PKG_TRACE
+          out_++;
+          LOG_DEBUG(std::string("delay DO: in:") + in_ + " out:" + out_);
+#endif
+          continue;
+        }
+#endif
         if ((sw_frame_->width != 0 || sw_frame_->height != 0) &&
             (sw_frame_->width != frame_->width ||
              sw_frame_->height != frame_->height)) {
@@ -281,6 +365,16 @@ private:
 
 } // namespace
 
+#ifdef RAM_DEC_SURFACE
+// Borrowed: the surface stays owned by the decoder and is released on the next
+// decode or in ffmpeg_ram_free_decoder(). Retain it to keep it longer.
+extern "C" void *ffmpeg_ram_decode_pixelbuffer(FFmpegRamDecoder *decoder) {
+  if (!decoder)
+    return NULL;
+  return decoder->last_pixelbuffer();
+}
+#endif
+
 extern "C" void ffmpeg_ram_free_decoder(FFmpegRamDecoder *decoder) {
   try {
     if (!decoder)
@@ -320,9 +414,10 @@ ffmpeg_ram_new_decoder(const char *name, int device_type, int thread_count,
 }
 
 extern "C" int ffmpeg_ram_decode(FFmpegRamDecoder *decoder, const uint8_t *data,
-                                 int length, const void *obj) {
+                                 int length, const void *obj,
+                                 int wants_surface) {
   try {
-    int ret = decoder->decode(data, length, obj);
+    int ret = decoder->decode(data, length, obj, wants_surface != 0);
     if (DataFormat::H265 == decoder->data_format_ && util_decode::has_flag_could_not_find_ref_with_poc()) {
       return HWCODEC_ERR_HEVC_COULD_NOT_FIND_POC;
     } else {
