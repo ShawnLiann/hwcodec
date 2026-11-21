@@ -272,15 +272,17 @@ private:
             LOG_ERROR(std::string(
                 "one packet produced more than one surface; the surface path "
                 "hands out at most one per packet"));
+            // The first frame of this packet already set decoded = true, and
+            // the exit path answers `decoded ? 0 : -1`. Clearing it is what
+            // makes this a rejection instead of a success carrying the first
+            // surface while the rest are dropped.
+            decoded = false;
             goto _exit;
           }
           CVPixelBufferRef pb = (CVPixelBufferRef)frame_->data[3];
-          // Drop ours first, then retain this one: ffmpeg's frame_ still holds
-          // the buffer for the rest of this call, so releasing before
-          // retaining stays safe even if the pool handed the same address
-          // back. One packet yields one frame, so the slot is empty here in
-          // practice and this is just the ordered form of the same pair.
-          release_last_pb();
+          // The slot is provably empty here: the entry guard released it, and
+          // the guard above rejects a second surface in the same packet. So
+          // this is a plain retain, not a release-then-retain pair.
           CFRetain(pb);
           last_pb_ = pb;
           decoded = true;

@@ -16,6 +16,7 @@ extern "C" {
     fn CVPixelBufferGetWidth(pixelbuffer: *mut c_void) -> usize;
     fn CVPixelBufferGetHeight(pixelbuffer: *mut c_void) -> usize;
     fn CVPixelBufferGetIOSurface(pixelbuffer: *mut c_void) -> *mut c_void;
+    fn CVPixelBufferGetPixelFormatType(pixelbuffer: *mut c_void) -> u32;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -50,6 +51,20 @@ fn surface_decode_hands_out_the_decoded_pixelbuffer() {
         // Mapping into a texture is the downstream step; it needs an
         // IOSurface-backed buffer, which the dimensions alone do not prove.
         assert!(!CVPixelBufferGetIOSurface(pixelbuffer).is_null());
+        // Which pixel format the decoder actually hands out, rather than what
+        // the design assumed: '420v' / '420f' (biplanar video/full range) or
+        // 'BGRA'. Printed so the requirement matrix can quote a measured value.
+        let fmt = CVPixelBufferGetPixelFormatType(pixelbuffer);
+        let fourcc: String = fmt
+            .to_be_bytes()
+            .iter()
+            .map(|b| if b.is_ascii_graphic() { *b as char } else { '.' })
+            .collect();
+        println!("decoded surface pixel format: {fourcc} (0x{fmt:08x})");
+        assert!(
+            matches!(fmt, 0x3432_3076 | 0x3432_3066 | 0x4247_5241),
+            "unexpected decoded pixel format {fourcc} (0x{fmt:08x})"
+        );
     }
 
     // Borrowed: the surface is valid until the next decode, and the next
