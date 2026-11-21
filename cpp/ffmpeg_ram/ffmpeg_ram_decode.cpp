@@ -266,11 +266,12 @@ private:
             goto _exit;
           }
           CVPixelBufferRef pb = (CVPixelBufferRef)frame_->data[3];
-          // A surface pool can hand the same buffer back for the next frame;
-          // releasing ours after retaining that address would cancel the
-          // retain. Only a different buffer means the old one is ours to drop.
-          if (pb != last_pb_)
-            release_last_pb();
+          // Drop ours first, then retain this one: ffmpeg's frame_ still holds
+          // the buffer for the rest of this call, so releasing before
+          // retaining stays safe even if the pool handed the same address
+          // back. One packet yields one frame, so the slot is empty here in
+          // practice and this is just the ordered form of the same pair.
+          release_last_pb();
           CFRetain(pb);
           last_pb_ = pb;
           decoded = true;
