@@ -31,7 +31,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-15]   # both arm64 runners; the Apple-only path is what matters
+        # macos-14 dropped: two runs in a row were cancelled for runner capacity
+        # before the job started, which reads as a red check for a reason that has
+        # nothing to do with the code. macos-15 is arm64 as well, so coverage is
+        # unchanged.
+        os: [macos-15]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
