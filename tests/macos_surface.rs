@@ -15,6 +15,7 @@ const H264_720P: &[u8] = include_bytes!("../src/res/720p.h264");
 extern "C" {
     fn CVPixelBufferGetWidth(pixelbuffer: *mut c_void) -> usize;
     fn CVPixelBufferGetHeight(pixelbuffer: *mut c_void) -> usize;
+    fn CVPixelBufferGetIOSurface(pixelbuffer: *mut c_void) -> *mut c_void;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -46,6 +47,9 @@ fn surface_decode_hands_out_the_decoded_pixelbuffer() {
     unsafe {
         assert_eq!(CVPixelBufferGetWidth(pixelbuffer), 1280);
         assert_eq!(CVPixelBufferGetHeight(pixelbuffer), 720);
+        // Mapping into a texture is the downstream step; it needs an
+        // IOSurface-backed buffer, which the dimensions alone do not prove.
+        assert!(!CVPixelBufferGetIOSurface(pixelbuffer).is_null());
     }
 
     // Borrowed: the surface is valid until the next decode, and the next
@@ -56,6 +60,7 @@ fn surface_decode_hands_out_the_decoded_pixelbuffer() {
     assert!(!second.is_null(), "surface after second decode");
     unsafe {
         assert_eq!(CVPixelBufferGetWidth(second), 1280);
+        assert!(!CVPixelBufferGetIOSurface(second).is_null());
     }
 }
 
