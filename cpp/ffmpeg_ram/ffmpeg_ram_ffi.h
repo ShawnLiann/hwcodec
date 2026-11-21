@@ -31,4 +31,31 @@ int ffmpeg_ram_get_linesize_offset_length(int pix_fmt, int width, int height,
                                           int *length);
 int ffmpeg_ram_set_bitrate(void *encoder, int kbs);
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if defined(__APPLE__) && TARGET_OS_OSX
+// The one way to ask a decoder for the VideoToolbox surface instead of a
+// software frame. The wish belongs to this call: nothing on the decoder
+// remembers it, so the next call -- through this function or through
+// ffmpeg_ram_decode() -- is free to want the other thing.
+//
+// One call, one surface: HWCODEC_SUCCESS always carries a surface in
+// *surface_out, and asking a decoder that is not videotoolbox, or decoding a
+// software frame, is an error rather than an empty success. One packet yields
+// at most one surface: a packet carrying several frames is rejected rather
+// than silently keeping only the last one (measured: packets carrying 2..120
+// access units all produced a single frame, so this guard should not fire in
+// practice; the software path above would deliver every frame it received).
+//
+// `obj` is kept only so this signature matches ffmpeg_ram_decode(); the
+// surface path never calls the callback and does not read it.
+//
+// The surface is borrowed. It stays valid until the next call to this decoder
+// -- including a call that decodes nothing, such as a rejected packet -- or
+// until ffmpeg_ram_free_decoder(); CFRetain it to keep it longer.
+int ffmpeg_ram_decode_surface(void *decoder, const uint8_t *data, int length,
+                              const void *obj, void **surface_out);
+#endif // __APPLE__ && TARGET_OS_OSX
+
 #endif // FFMPEG_RAM_FFI_H

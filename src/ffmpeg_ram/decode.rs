@@ -3,6 +3,8 @@ use super::Priority;
 use crate::common::TEST_TIMEOUT_MS;
 use crate::ffmpeg::{init_av_log, AVHWDeviceType::*};
 
+#[cfg(target_os = "macos")]
+use crate::ffmpeg_ram::ffmpeg_ram_decode_surface;
 use crate::{
     common::DataFormat::*,
     ffmpeg::{AVHWDeviceType, AVPixelFormat},
@@ -101,6 +103,37 @@ impl Decoder {
                 Err(ret)
             } else {
                 Ok(&mut *self.frames)
+            }
+        }
+    }
+
+    /// One decode, one surface: this call asks for the VideoToolbox surface
+    /// and gets it back in the same call, borrowed -- valid until the next
+    /// decode on this decoder or its drop, retain it to keep it longer. The
+    /// frame callback is not called, so the software frame list stays empty by
+    /// design; asking for a surface on a decode that fell back to software is
+    /// an error rather than a frame nobody reads. Success and a surface are
+    /// therefore the same thing: there is no empty success.
+    #[cfg(target_os = "macos")]
+    pub fn decode_surface(&mut self, packet: &[u8]) -> Result<*mut c_void, i32> {
+        unsafe {
+            (&mut *self.frames).clear();
+            let mut surface: *mut c_void = std::ptr::null_mut();
+            let ret = ffmpeg_ram_decode_surface(
+                self.codec,
+                packet.as_ptr(),
+                packet.len() as c_int,
+                self.frames as *const _ as *const c_void,
+                &mut surface,
+            );
+            if ret < 0 {
+                Err(ret)
+            } else if surface.is_null() {
+                // The C side will not report success without a surface; if it
+                // ever does, do not hand out a null the caller would map.
+                Err(-1)
+            } else {
+                Ok(surface)
             }
         }
     }
