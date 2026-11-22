@@ -193,11 +193,6 @@ public:
     LOG_DEBUG(std::string("delay DI: in:") + in_ + " out:" + out_);
 #endif
 
-#ifdef RAM_DEC_SURFACE
-    // One surface per decode, including the calls that decode nothing: a
-    // caller must never read the surface an earlier call produced.
-    release_last_pb();
-#endif
     if (!data || !length) {
       LOG_ERROR(std::string("illegal decode parameter"));
       return -1;
@@ -208,6 +203,11 @@ public:
           "a surface was asked of a decoder that is not videotoolbox"));
       return -1;
     }
+    // Owner decision D10 (2026-11-22 08:5x): the borrowed surface is NOT
+    // dropped by a call the guards above reject -- those calls decode nothing,
+    // so they must not invalidate what an earlier call handed out. Reaching
+    // here means a decode is about to happen, which is what ends the borrow.
+    release_last_pb();
 #else
     (void)wants_surface;
 #endif

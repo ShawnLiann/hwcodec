@@ -101,8 +101,8 @@ fn a_retained_surface_outlives_the_next_decode() {
         assert_eq!(CVPixelBufferGetHeight(kept as *mut c_void), 720);
     }
 
-    // A call that decodes nothing still drops ours -- and still must not
-    // invalidate the copy the consumer retained.
+    // A rejected call decodes nothing, so per the D10 contract it ends neither
+    // the borrow nor the consumer's retained copy.
     assert!(
         decoder.decode_surface(&[]).is_err(),
         "an empty packet is rejected before it reaches the decoder"

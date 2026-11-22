@@ -53,8 +53,10 @@ int ffmpeg_ram_set_bitrate(void *encoder, int kbs);
 // surface path never calls the callback and does not read it.
 //
 // The surface is borrowed. It stays valid until the next call to this decoder
-// -- including a call that decodes nothing, such as a rejected packet -- or
-// until ffmpeg_ram_free_decoder(); CFRetain it to keep it longer.
+// that actually decodes, or until ffmpeg_ram_free_decoder(); CFRetain it to
+// keep it longer. A call rejected by the guards (empty packet, or asking a
+// non-VideoToolbox decoder for a surface) decodes nothing and therefore does
+// NOT end the borrow.
 //
 // A rejected packet returns the same -1 ffmpeg_ram_decode() already uses for
 // both "the decoder is broken" and "this packet has not produced a frame yet";
